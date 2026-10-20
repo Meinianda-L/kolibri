@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Kolibri Launcher additions (GPL-3.0-or-later, see guest/launcher/README.md). -->
+<resources>
+    <!-- Label of the tutorial icon on the default home screen. -->
+    <string name="kolibri_tutorial_title">Tutorial</string>
+    <!-- Page opened by the tutorial icon (placeholder). -->
+    <string name="kolibri_tutorial_url" translatable="false">https://github.com/kolibri/kolibri#readme</string>
+    <color name="kolibri_tutorial_icon_background">#FF2F6BFF</color>
+</resources>

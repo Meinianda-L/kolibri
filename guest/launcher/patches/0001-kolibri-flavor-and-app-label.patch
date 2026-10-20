@@ -1,0 +1,42 @@
+diff --git a/build.gradle b/build.gradle
+index fc3ef62..d1ee9f8 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -244,11 +244,11 @@ android {
+ 
+         debug {
+             applicationIdSuffix ".debug"
+-            resValue("string", "derived_app_name", "Lawnchair (Debug)")
++            resValue("string", "derived_app_name", "Kolibri Launcher (Debug)")
+         }
+ 
+         release {
+-            resValue("string", "derived_app_name", "Lawnchair")
++            resValue("string", "derived_app_name", "Kolibri Launcher")
+             minifyEnabled true
+             shrinkResources true
+             proguardFiles proguardFilesFromAosp + "proguard.pro"
+@@ -290,6 +290,12 @@ android {
+         play {
+             applicationId "app.lawnchair.play"
+             dimension "channel"
++        }
++
++        // Kolibri: guest home launcher for the Kolibri emulator.
++        kolibri {
++            applicationId "dev.kolibri.launcher"
++            dimension "channel"
+             isDefault true
+         }
+ 
+@@ -341,6 +347,10 @@ android {
+             manifest.srcFile "quickstep/AndroidManifest-launcher.xml"
+         }
+ 
++        lawnWithQuickstepKolibri {
++            manifest.srcFile "quickstep/AndroidManifest-launcher.xml"
++        }
++
+         withQuickstep {
+             res.srcDirs = ['quickstep/res', 'quickstep/recents_ui_overrides/res']
+             java.srcDirs = ['quickstep/src', 'quickstep/recents_ui_overrides/src']

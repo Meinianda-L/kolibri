@@ -1,0 +1,16 @@
+{
+  "title": "iQOO 12",
+  "title_en": "iQOO 12",
+  "brand": "vivo",
+  "manufacturer": "vivo",
+  "model": "V2307A",
+  "device": "PD2307",
+  "product": "PD2307",
+  "board": "pineapple",
+  "platform": "pineapple",
+  "hardware": "qcom",
+  "soc_manufacturer": "QTI",
+  "soc_model": "SM8650",
+  "gpu_renderer": "Adreno (TM) 750",
+  "refresh_hz": 120
+}

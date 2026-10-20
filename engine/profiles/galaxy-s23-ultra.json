@@ -1,0 +1,16 @@
+{
+  "title": "三星 Galaxy S23 Ultra",
+  "title_en": "Samsung Galaxy S23 Ultra",
+  "brand": "samsung",
+  "manufacturer": "samsung",
+  "model": "SM-S9180",
+  "device": "dm3q",
+  "product": "dm3qzc",
+  "board": "kalama",
+  "platform": "kalama",
+  "hardware": "qcom",
+  "soc_manufacturer": "QTI",
+  "soc_model": "SM8550",
+  "gpu_renderer": "Adreno (TM) 740",
+  "refresh_hz": 120
+}

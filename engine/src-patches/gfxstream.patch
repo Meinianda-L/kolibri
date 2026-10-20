@@ -1,0 +1,771 @@
+diff --git a/host/frame_buffer.cpp b/host/frame_buffer.cpp
+index be726e6..3a52185 100644
+--- a/host/frame_buffer.cpp
++++ b/host/frame_buffer.cpp
+@@ -62,6 +62,7 @@
+ #include "render_thread_info.h"
+ #include "sync_thread.h"
+ #include "vulkan/display_vk.h"
++#include "vulkan/kolibri_iosurface_export.h"
+ #include "vulkan/post_worker_vk.h"
+ #include "vulkan/vk_common_operations.h"
+ #include "vulkan/vk_decoder_global_state.h"
+@@ -952,6 +953,8 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
+     bool m_noDelayCloseColorBufferEnabled = false;
+ 
+     std::unique_ptr<PostWorker> m_postWorker = {};
++    // Kolibri: posted frames blitted into IOSurfaces the frontend samples (zero copy).
++    std::unique_ptr<vk::IOSurfaceFrameExporter> m_iosurfaceExporter;
+     std::atomic_bool m_postThreadStarted = false;
+     gfxstream::base::WorkerThread<Post> m_postThread;
+     gfxstream::base::WorkerProcessingResult postWorkerFunc(Post& post);
+@@ -1456,6 +1459,8 @@ std::unique_ptr<FrameBuffer::Impl> FrameBuffer::Impl::Create(FrameBuffer* frameb
+     GFXSTREAM_INFO("Graphics Device Extensions %s", impl->m_graphicsDeviceExtensions.c_str());
+ 
+     if (impl->m_useVulkanComposition) {
++        impl->m_iosurfaceExporter = vk::IOSurfaceFrameExporter::createFromEnv(
++            impl->m_emulationVk.get(), impl->m_framebufferWidth, impl->m_framebufferHeight);
+         impl->m_postWorker.reset(
+             new PostWorkerVk(impl.get(), impl->m_compositor, impl->m_displayVk));
+     } else {
+@@ -1575,6 +1580,9 @@ FrameBuffer::Impl::~Impl() {
+     if (m_emulationGl) {
+         m_emulationGl.reset();
+     }
++    // The IOSurface exporter frees its images through VkEmulation: drop it first
++    // (as a member it would otherwise be destroyed after m_emulationVk, crashing on exit).
++    m_iosurfaceExporter.reset();
+     if (m_emulationVk) {
+         vk::VkDecoderGlobalState::reset();
+         m_emulationVk.reset();
+@@ -2645,6 +2653,9 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
+     m_lastPostedColorBuffer = p_colorbuffer;
+ 
+     colorBuffer->touch();
++    if (m_iosurfaceExporter) {
++        m_iosurfaceExporter->post(p_colorbuffer);
++    }
+     if (m_subWin) {
+         Post postCmd;
+         postCmd.cmd = PostCmd::Post;
+diff --git a/host/gl/gles_version_detector.cpp b/host/gl/gles_version_detector.cpp
+index 34415eb..9c1befe 100644
+--- a/host/gl/gles_version_detector.cpp
++++ b/host/gl/gles_version_detector.cpp
+@@ -129,8 +129,13 @@ bool shouldEnableCoreProfile() {
+     int dispatchMaj, dispatchMin;
+ 
+     get_gfxstream_gles_version(&dispatchMaj, &dispatchMin);
++    // Kolibri: with EGL-on-EGL the translator runs on a GLES driver (host ANGLE), which has
++    // no desktop core profile; "#version 330 core" helper shaders then fail to compile and
++    // every composed/posted frame comes out black or partial.
++    static const bool sEglOnEgl =
++        gfxstream::base::getEnvironmentVariable("ANDROID_EGL_ON_EGL") == "1";
+     return get_gfxstream_renderer() == SELECTED_RENDERER_HOST &&
+-           dispatchMaj > 2;
++           dispatchMaj > 2 && !sEglOnEgl;
+ }
+ 
+ void sAddExtensionIfSupported(GLESDispatchMaxVersion currVersion,
+diff --git a/host/gl/glestranslator/common/include/common/texture_data.h b/host/gl/glestranslator/common/include/common/texture_data.h
+index 9e41fdf..652ce5e 100644
+--- a/host/gl/glestranslator/common/include/common/texture_data.h
++++ b/host/gl/glestranslator/common/include/common/texture_data.h
+@@ -86,6 +86,10 @@ public:
+     // deprecated; texture parameters are dealt with by SaveableTexture
+     void setTexParam(GLenum pname, GLint param);
+     GLenum getSwizzle(GLenum component) const;
++    GLint getTexParamOr(GLenum pname, GLint fallback) const {
++        auto it = m_texParam.find(pname);
++        return it == m_texParam.end() ? fallback : it->second;
++    }
+ 
+     void makeDirty();
+     void setTarget(GLenum _target);
+diff --git a/host/gl/glestranslator/egl/mac_native.m b/host/gl/glestranslator/egl/mac_native.m
+index 15893c9..c8c5f81 100644
+--- a/host/gl/glestranslator/egl/mac_native.m
++++ b/host/gl/glestranslator/egl/mac_native.m
+@@ -274,7 +274,7 @@ void nsConvertVideoFrameToNV12Textures(void* context,
+ 
+     glEnable(GL_TEXTURE_RECTANGLE);
+ 
+-    IOSurfaceRef* surface = (IOSurfaceRef*)iosurface;
++    IOSurfaceRef surface = (IOSurfaceRef)iosurface;
+ 
+     GLsizei surface_w = (GLsizei)IOSurfaceGetWidth(surface);
+     GLsizei surface_h = (GLsizei)IOSurfaceGetHeight(surface);
+diff --git a/host/gl/glestranslator/gles_v2/gles_v2_context.cpp b/host/gl/glestranslator/gles_v2/gles_v2_context.cpp
+index c8e911a..0a2de7b 100644
+--- a/host/gl/glestranslator/gles_v2/gles_v2_context.cpp
++++ b/host/gl/glestranslator/gles_v2/gles_v2_context.cpp
+@@ -252,6 +252,13 @@ void GLESv2Context::postLoadRestoreCtx() {
+             genVAOName(vaoIte.first, false);
+         }
+         dispatcher.glBindVertexArray(getVAOGlobalName(vaoIte.first));
++        // Kolibri: each VAO owns its element array buffer binding. Only the current VAO's
++        // was restored (GLEScontext::postLoadRestoreCtx), so after a snapshot load every
++        // other VAO drew with its index offset taken as a client pointer (host crash loop
++        // in ANGLE's index conversion, frozen screen).
++        dispatcher.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,
++                shareGroup()->getGlobalName(NamedObjectType::VERTEXBUFFER,
++                                            vaoIte.second.element_array_buffer_binding));
+         for (uint32_t i = 0; i < kMaxVertexAttributes; ++i) {
+             GLESpointer* glesPointer =
+                 (GLESpointer*)(vaoIte.second.vertexAttribInfo.data() + i);
+diff --git a/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp b/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
+index b22bf1a..ed6e36c 100644
+--- a/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
++++ b/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
+@@ -135,6 +135,44 @@ static GLESiface s_glesIface = {
+ 
+ #include <common/gles_macros.h>
+ 
++// Kolibri debug: KOLIBRI_TEX_TRACE=1 logs texture-array / mipmap calls and the host error.
++static bool kolibriTexTrace() {
++    static const bool on = getenv("KOLIBRI_TEX_TRACE") != nullptr;
++    return on;
++}
++// Kolibri: the guest GLES driver (goldfish GL2Encoder::s_glGenerateMipmap) rejects
++// glGenerateMipmap on GL_BGRA_EXT textures with GL_INVALID_OPERATION before it reaches the
++// host (BGRA is missing from its unsized/color-renderable format lists). Apps that upload
++// BGRA (Irrlicht/Luanti texture arrays) then sample an incomplete texture: black terrain.
++// When such a texture is set to a mipmap min filter, or its level 0 is re-uploaded while
++// it has one, generate the mip chain on the host, as the app asked for.
++static bool kolibriIsMipmapFilter(GLint f) {
++    return f == GL_NEAREST_MIPMAP_NEAREST || f == GL_LINEAR_MIPMAP_NEAREST ||
++           f == GL_NEAREST_MIPMAP_LINEAR || f == GL_LINEAR_MIPMAP_LINEAR;
++}
++static void kolibriBgraAutoMipmap(GLEScontext* ctx, TextureData* texData, GLenum target, GLint level) {
++    if (!texData || level != 0 || !texData->hasStorage || texData->texStorageLevels != 0) return;
++    if (texData->internalFormat != GL_BGRA_EXT && texData->internalFormat != GL_BGRA8_EXT) return;
++    if (!kolibriIsMipmapFilter(texData->getTexParamOr(GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_LINEAR))) return;
++    if (target != GL_TEXTURE_2D && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_3D &&
++        target != GL_TEXTURE_CUBE_MAP) return;
++    ctx->dispatcher().glGenerateMipmap(target);
++    unsigned int levels = 0;
++    for (unsigned int size = std::max(texData->width, texData->height); size > 1; size >>= 1) levels++;
++    texData->setMipmapLevelAtLeast(levels);
++}
++
++#define KOLIBRI_TEX_TRACE(ctx, fmt, ...)                                                   \
++    do {                                                                                  \
++        if (kolibriTexTrace()) {                                                          \
++            static int budget = 400;                                                      \
++            if (budget-- > 0) {                                                           \
++                GLenum kerr = (ctx)->dispatcher().glGetError();                           \
++                fprintf(stderr, "KTEX " fmt " -> err 0x%x\n", ##__VA_ARGS__, kerr);       \
++            }                                                                             \
++        }                                                                                 \
++    } while (0)
++
+ namespace translator {
+ namespace gles2 {
+ 
+@@ -1834,6 +1872,7 @@ GL_APICALL void  GL_APIENTRY glGenerateMipmap(GLenum target){
+         }
+     }
+     ctx->dispatcher().glGenerateMipmap(target);
++    KOLIBRI_TEX_TRACE(ctx, "glGenerateMipmap(0x%x)", target);
+ }
+ 
+ GL_APICALL void  GL_APIENTRY glGenFramebuffers(GLsizei n, GLuint* framebuffers){
+@@ -3609,6 +3648,7 @@ GL_APICALL void  GL_APIENTRY glTexImage2D(GLenum target, GLint level, GLint inte
+         fprintf(stderr, "%s: got err :( 0x%x internal 0x%x format 0x%x type 0x%x\n", __func__, err, internalformat, format, type);
+         ctx->setGLerror(err);                                    \
+     }
++    if (pixels) kolibriBgraAutoMipmap(ctx, getTextureTargetData(target), target, level);
+ }
+ 
+ static void sEmulateUserTextureSwizzle(TextureData* texData,
+@@ -3675,6 +3715,10 @@ GL_APICALL void  GL_APIENTRY glTexParameteri(GLenum target, GLenum pname, GLint
+     } else {
+         ctx->dispatcher().glTexParameteri(target,pname,param);
+     }
++    if (pname == GL_TEXTURE_MIN_FILTER && kolibriIsMipmapFilter(param)) {
++        kolibriBgraAutoMipmap(ctx, texData, target, 0);
++    }
++    if (target != GL_TEXTURE_2D) KOLIBRI_TEX_TRACE(ctx, "glTexParameteri(0x%x, 0x%x, 0x%x)", target, pname, param);
+ }
+ 
+ GL_APICALL void  GL_APIENTRY glTexParameteriv(GLenum target, GLenum pname, const GLint* params){
+@@ -3878,6 +3922,7 @@ GL_APICALL void  GL_APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x
+     texData->setMipmapLevelAtLeast(level);
+     texData->makeDirty();
+     ctx->dispatcher().glTexSubImage2D(target,level,xoffset,yoffset,width,height,format,type,pixels);
++    kolibriBgraAutoMipmap(ctx, texData, target, level);
+ }
+ 
+ static int s_getHostLocOrSetError(GLESv2Context* ctx, GLint location) {
+diff --git a/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp b/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
+index 5d4cb85..82d37ba 100644
+--- a/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
++++ b/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
+@@ -1087,6 +1087,8 @@ GL_APICALL void GL_APIENTRY glTexImage3D(GLenum target, GLint level, GLint inter
+     }
+ 
+     ctx->dispatcher().glTexImage3D(target, level, internalFormat, width, height, depth, border, format, type, data);
++    KOLIBRI_TEX_TRACE(ctx, "glTexImage3D(0x%x, lvl %d, ifmt 0x%x, %dx%dx%d, fmt 0x%x, type 0x%x, data %p)",
++                      target, level, internalFormat, width, height, depth, format, type, data);
+ }
+ 
+ GL_APICALL void GL_APIENTRY glTexStorage3D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth) {
+@@ -1103,6 +1105,8 @@ GL_APICALL void GL_APIENTRY glTexStorage3D(GLenum target, GLsizei levels, GLenum
+     TextureData *texData = getTextureTargetData(target);
+     texData->texStorageLevels = levels;
+     ctx->dispatcher().glTexStorage3D(target, levels, internalformat, width, height, depth);
++    KOLIBRI_TEX_TRACE(ctx, "glTexStorage3D(0x%x, levels %d, ifmt 0x%x, %dx%dx%d)", target, levels,
++                      internalformat, width, height, depth);
+ }
+ 
+ GL_APICALL void GL_APIENTRY glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const GLvoid * data) {
+@@ -1117,6 +1121,9 @@ GL_APICALL void GL_APIENTRY glTexSubImage3D(GLenum target, GLint level, GLint xo
+         texData->makeDirty();
+     }
+     ctx->dispatcher().glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, data);
++    kolibriBgraAutoMipmap(ctx, texData, target, level);
++    KOLIBRI_TEX_TRACE(ctx, "glTexSubImage3D(0x%x, lvl %d, off %d,%d,%d, %dx%dx%d, fmt 0x%x, type 0x%x)", target,
++                      level, xoffset, yoffset, zoffset, width, height, depth, format, type);
+ }
+ 
+ GL_APICALL void GL_APIENTRY glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const GLvoid * data) {
+diff --git a/host/render_control.cpp b/host/render_control.cpp
+index 08a8059..5839922 100644
+--- a/host/render_control.cpp
++++ b/host/render_control.cpp
+@@ -22,6 +22,11 @@
+ #include <atomic>
+ #include <limits>
+ #include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++#include "gfxstream/system/System.h"
+ 
+ #include "frame_buffer.h"
+ #include "host/gl/gles_version_detector.h"
+@@ -195,6 +200,26 @@ static const char* kDirectMemStr = "ANDROID_EMU_direct_mem";
+ static const char* kGLESDynamicVersion_2 = "ANDROID_EMU_gles_max_version_2";
+ static const char* kGLESDynamicVersion_3_0 = "ANDROID_EMU_gles_max_version_3_0";
+ static const char* kGLESDynamicVersion_3_1 = "ANDROID_EMU_gles_max_version_3_1";
++static const char* kGLESDynamicVersion_3_2 = "ANDROID_EMU_gles_max_version_3_2";
++
++// Kolibri: what games are told about the GPU (phone identity). Read once.
++//   KOLIBRI_GPU_RENDERER / KOLIBRI_GPU_VENDOR: GL_RENDERER / GL_VENDOR
++//   KOLIBRI_GL_VERSION: the whole GL_VERSION string (e.g. "OpenGL ES 3.2 V@0615.0")
++//   KOLIBRI_GLES_MAX=3.2: advertise ES 3.2 to the guest driver. The host context stays
++//     ES 3.1 (ANGLE on MoltenVK has no geometry shaders); 3.2-only entry points are
++//     unsupported, like on many real "3.2" drivers that lack extensions.
++static const std::string& kolibriEnv(const char* name) {
++    static std::mutex m;
++    static std::unordered_map<std::string, std::string> cache;
++    std::lock_guard<std::mutex> lock(m);
++    auto it = cache.find(name);
++    if (it == cache.end()) {
++        it = cache.emplace(name, gfxstream::base::getEnvironmentVariable(name)).first;
++    }
++    return it->second;
++}
++
++static bool kolibriAdvertiseGles32() { return kolibriEnv("KOLIBRI_GLES_MAX") == "3.2"; }
+ 
+ // HWComposer Host Composition
+ static const char* kHostCompositionV1 = "ANDROID_EMU_host_composition_v1";
+@@ -661,7 +686,11 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
+             glStr += " ";
+         }
+ 
+-        glStr += maxVersionToFeatureString(guestExtVer);
++        if (guestExtVer >= GLES_DISPATCH_MAX_VERSION_3_1 && kolibriAdvertiseGles32()) {
++            glStr += kGLESDynamicVersion_3_2;
++        } else {
++            glStr += maxVersionToFeatureString(guestExtVer);
++        }
+         glStr += " ";
+     }
+ 
+@@ -680,7 +709,7 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
+                 glStr = replaceESVersionString(glStr, "3.0");
+                 break;
+             case GLES_DISPATCH_MAX_VERSION_3_1:
+-                glStr = replaceESVersionString(glStr, "3.1");
++                glStr = replaceESVersionString(glStr, kolibriAdvertiseGles32() ? "3.2" : "3.1");
+                 break;
+             default:
+                 break;
+@@ -688,6 +717,15 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
+         } else {
+             glStr = replaceESVersionString(glStr, "2.0");
+         }
++        if (!kolibriEnv("KOLIBRI_GL_VERSION").empty()) {
++            glStr = kolibriEnv("KOLIBRI_GL_VERSION");
++        }
++    }
++    if (name == GL_RENDERER && !kolibriEnv("KOLIBRI_GPU_RENDERER").empty()) {
++        glStr = kolibriEnv("KOLIBRI_GPU_RENDERER");
++    }
++    if (name == GL_VENDOR && !kolibriEnv("KOLIBRI_GPU_VENDOR").empty()) {
++        glStr = kolibriEnv("KOLIBRI_GPU_VENDOR");
+     }
+ 
+     int nextBufferSize = glStr.size() + 1;
+diff --git a/host/vulkan/CMakeLists.txt b/host/vulkan/CMakeLists.txt
+index 149c4e7..9f2a918 100644
+--- a/host/vulkan/CMakeLists.txt
++++ b/host/vulkan/CMakeLists.txt
+@@ -31,6 +31,7 @@ add_library(gfxstream-vulkan-server
+             display_surface_vk.cpp
+             debug_utils_helper.cpp
+             external_memory.cpp
++            kolibri_iosurface_export.cpp
+             post_worker_vk.cpp
+             swap_chain_state_vk.cpp
+             render_thread_info_vk.cpp
+diff --git a/host/vulkan/kolibri_iosurface_export.cpp b/host/vulkan/kolibri_iosurface_export.cpp
+new file mode 100644
+index 0000000..343fe82
+--- /dev/null
++++ b/host/vulkan/kolibri_iosurface_export.cpp
+@@ -0,0 +1,205 @@
++// Kolibri: zero-copy frame delivery to the Kolibri frontend (macOS). See the header.
++//
++// Shared header file layout (little-endian, 128 bytes; the frontend maps it too):
++//   0  u32 magic 'KIOS' (0x534F494B)      4  u32 version (1)
++//   8  u32 width                          12 u32 height
++//   16 u32 pixel format ('BGRA')          20 u32 surface count (4)
++//   24 u32 IOSurfaceID[4]
++//   40 u64 seq       number of the newest finished frame (0: none yet)
++//   48 u32 latest    surface index holding frame `seq`
++//   52 u32 reading   frontend: index it is sampling (0xffffffff: none)
++//   56 u64 heartbeat frontend: CLOCK_UPTIME_RAW ns of its last look; no reader for 1 s
++//                    means nothing is copied
++//   64 u64 publish   engine: CLOCK_UPTIME_RAW ns when frame `seq` finished
++// A frame goes to a surface that is neither the newest, the one before it, nor the one
++// the frontend reads, so a frame being shown is never overwritten.
++#include "kolibri_iosurface_export.h"
++
++#if defined(__APPLE__)
++
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOSurface/IOSurfaceRef.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <atomic>
++#include <string>
++
++#include "gfxstream/common/logging.h"
++#include "gfxstream/system/System.h"
++#include "vk_common_operations.h"
++
++namespace gfxstream {
++namespace host {
++namespace vk {
++namespace {
++
++constexpr uint32_t kMagic = 0x534F494B;  // 'KIOS'
++constexpr uint32_t kCount = 4;
++constexpr uint32_t kNone = 0xffffffffu;
++constexpr uint64_t kReaderTimeoutNs = 1000ull * 1000ull * 1000ull;
++
++struct alignas(8) SharedHeader {
++    uint32_t magic;
++    uint32_t version;
++    uint32_t width;
++    uint32_t height;
++    uint32_t pixelFormat;
++    uint32_t count;
++    uint32_t ids[kCount];
++    std::atomic<uint64_t> seq;
++    std::atomic<uint32_t> latest;
++    std::atomic<uint32_t> reading;
++    std::atomic<uint64_t> heartbeatNs;
++    std::atomic<uint64_t> publishNs;
++    uint8_t reserved[56];
++};
++static_assert(sizeof(SharedHeader) == 128, "shared layout");
++
++void setNumber(CFMutableDictionaryRef dict, CFStringRef key, int32_t value) {
++    CFNumberRef n = CFNumberCreate(nullptr, kCFNumberSInt32Type, &value);
++    CFDictionarySetValue(dict, key, n);
++    CFRelease(n);
++}
++
++class IOSurfaceFrameExporterImpl : public IOSurfaceFrameExporter {
++   public:
++    IOSurfaceFrameExporterImpl(VkEmulation* vk, uint32_t width, uint32_t height)
++        : mVk(vk), mWidth(width), mHeight(height) {}
++
++    ~IOSurfaceFrameExporterImpl() override {
++        for (auto& s : mSlots) {
++            mVk->destroyIOSurfaceImage(s.image, s.memory);
++            if (s.surface) CFRelease(s.surface);
++        }
++        if (mHeader) {
++            mHeader->magic = 0;
++            munmap(mHeader, sizeof(SharedHeader));
++        }
++    }
++
++    bool init(const std::string& path) {
++        CFMutableDictionaryRef props = CFDictionaryCreateMutable(
++            nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        setNumber(props, kIOSurfaceWidth, (int32_t)mWidth);
++        setNumber(props, kIOSurfaceHeight, (int32_t)mHeight);
++        setNumber(props, kIOSurfaceBytesPerElement, 4);
++        setNumber(props, kIOSurfacePixelFormat, (int32_t)'BGRA');
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++        // Found by ID from the frontend process (IOSurfaceLookup); both are local and unsandboxed.
++        CFDictionarySetValue(props, kIOSurfaceIsGlobal, kCFBooleanTrue);
++#pragma clang diagnostic pop
++        bool ok = true;
++        for (auto& s : mSlots) {
++            s.surface = IOSurfaceCreate(props);
++            if (!s.surface) { ok = false; break; }
++            s.image = mVk->createImageFromIOSurface(s.surface, mWidth, mHeight,
++                                                    VK_FORMAT_B8G8R8A8_UNORM, &s.memory);
++            if (!s.image) { ok = false; break; }
++        }
++        CFRelease(props);
++        if (!ok) {
++            GFXSTREAM_ERROR("Kolibri: IOSurface frame export unavailable (surface/image creation)");
++            return false;
++        }
++
++        int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
++        if (fd < 0 || ftruncate(fd, sizeof(SharedHeader)) != 0) {
++            if (fd >= 0) close(fd);
++            GFXSTREAM_ERROR("Kolibri: cannot create %s", path.c_str());
++            return false;
++        }
++        void* p = mmap(nullptr, sizeof(SharedHeader), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        close(fd);
++        if (p == MAP_FAILED) return false;
++        mHeader = static_cast<SharedHeader*>(p);
++        mHeader->version = 1;
++        mHeader->width = mWidth;
++        mHeader->height = mHeight;
++        mHeader->pixelFormat = 'BGRA';
++        mHeader->count = kCount;
++        for (uint32_t i = 0; i < kCount; i++) mHeader->ids[i] = IOSurfaceGetID(mSlots[i].surface);
++        mHeader->seq.store(0);
++        mHeader->latest.store(kNone);
++        mHeader->reading.store(kNone);
++        mHeader->heartbeatNs.store(0);
++        std::atomic_thread_fence(std::memory_order_release);
++        mHeader->magic = kMagic;  // valid from here on
++        GFXSTREAM_INFO("Kolibri: IOSurface frame export %ux%u via %s", mWidth, mHeight,
++                       path.c_str());
++        return true;
++    }
++
++    void post(uint32_t colorBufferHandle) override {
++        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++        const uint64_t beat = mHeader->heartbeatNs.load(std::memory_order_relaxed);
++        if (beat == 0 || now - beat > kReaderTimeoutNs) return;  // nobody is watching
++
++        const uint32_t reading = mHeader->reading.load(std::memory_order_acquire);
++        uint32_t target = kNone;
++        for (uint32_t i = 0; i < kCount; i++) {
++            if (i != mLatest && i != mPrevious && i != reading) {
++                target = i;
++                break;
++            }
++        }
++        if (target == kNone) return;
++        Slot& s = mSlots[target];
++        if (!mVk->blitColorBufferToImage(colorBufferHandle, s.image, &s.layout, mWidth, mHeight)) {
++            return;
++        }
++        mPrevious = mLatest;
++        mLatest = target;
++        mHeader->latest.store(target, std::memory_order_relaxed);
++        mHeader->publishNs.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), std::memory_order_relaxed);
++        mHeader->seq.fetch_add(1, std::memory_order_release);
++    }
++
++   private:
++    struct Slot {
++        IOSurfaceRef surface = nullptr;
++        VkImage image = VK_NULL_HANDLE;
++        VkDeviceMemory memory = VK_NULL_HANDLE;
++        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
++    };
++    VkEmulation* mVk;
++    const uint32_t mWidth;
++    const uint32_t mHeight;
++    Slot mSlots[kCount];
++    SharedHeader* mHeader = nullptr;
++    uint32_t mLatest = kNone;
++    uint32_t mPrevious = kNone;
++};
++
++}  // namespace
++
++std::unique_ptr<IOSurfaceFrameExporter> IOSurfaceFrameExporter::createFromEnv(
++    VkEmulation* emulationVk, uint32_t width, uint32_t height) {
++    const std::string path = gfxstream::base::getEnvironmentVariable("KOLIBRI_IOSURFACE_HEADER");
++    if (path.empty() || !emulationVk || !width || !height) return nullptr;
++    auto exporter = std::make_unique<IOSurfaceFrameExporterImpl>(emulationVk, width, height);
++    if (!exporter->init(path)) return nullptr;
++    return exporter;
++}
++
++}  // namespace vk
++}  // namespace host
++}  // namespace gfxstream
++
++#else  // !__APPLE__
++
++namespace gfxstream {
++namespace host {
++namespace vk {
++std::unique_ptr<IOSurfaceFrameExporter> IOSurfaceFrameExporter::createFromEnv(VkEmulation*,
++                                                                              uint32_t, uint32_t) {
++    return nullptr;
++}
++}  // namespace vk
++}  // namespace host
++}  // namespace gfxstream
++
++#endif
+diff --git a/host/vulkan/kolibri_iosurface_export.h b/host/vulkan/kolibri_iosurface_export.h
+new file mode 100644
+index 0000000..374c630
+--- /dev/null
++++ b/host/vulkan/kolibri_iosurface_export.h
+@@ -0,0 +1,31 @@
++// Kolibri: zero-copy frame delivery to the Kolibri frontend (macOS).
++//
++// Zero-copy presentation: instead of reading every posted frame back to the CPU and
++// streaming it over gRPC (MMAP transport), the engine blits it on the GPU into one of a
++// few IOSurfaces. The frontend wraps the same IOSurfaces as MTLTextures and samples them
++// directly. A small shared header file (KOLIBRI_IOSURFACE_HEADER) carries the IOSurface
++// IDs and the number of the newest finished frame; see kolibri_iosurface_export.cpp.
++#pragma once
++
++#include <cstdint>
++#include <memory>
++
++namespace gfxstream {
++namespace host {
++namespace vk {
++
++class VkEmulation;
++
++class IOSurfaceFrameExporter {
++   public:
++    // Null unless $KOLIBRI_IOSURFACE_HEADER names the header file to publish.
++    static std::unique_ptr<IOSurfaceFrameExporter> createFromEnv(VkEmulation* emulationVk,
++                                                                 uint32_t width, uint32_t height);
++    virtual ~IOSurfaceFrameExporter() = default;
++    // A ColorBuffer was posted to the display: copy it out if a frontend is reading.
++    virtual void post(uint32_t colorBufferHandle) = 0;
++};
++
++}  // namespace vk
++}  // namespace host
++}  // namespace gfxstream
+diff --git a/host/vulkan/vk_common_operations.cpp b/host/vulkan/vk_common_operations.cpp
+index 23f41e0..4fec7e1 100644
+--- a/host/vulkan/vk_common_operations.cpp
++++ b/host/vulkan/vk_common_operations.cpp
+@@ -4229,6 +4229,171 @@ bool VkEmulation::updateColorBufferFromBytes(uint32_t colorBufferHandle, uint32_
+     return updateColorBufferFromBytesLocked(colorBufferHandle, x, y, w, h, pixels, 0);
+ }
+ 
++#if defined(__APPLE__)
++VkImage VkEmulation::createImageFromIOSurface(IOSurfaceRef surface, uint32_t width,
++                                              uint32_t height, VkFormat format,
++                                              VkDeviceMemory* outMemory) {
++    auto vk = mDvk;
++    std::lock_guard<std::mutex> lock(mMutex);
++    VkImportMetalIOSurfaceInfoEXT importInfo = {
++        .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
++        .pNext = nullptr,
++        .ioSurface = surface,
++    };
++    const VkImageCreateInfo createInfo = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++        .pNext = &importInfo,
++        .flags = 0,
++        .imageType = VK_IMAGE_TYPE_2D,
++        .format = format,
++        .extent = {width, height, 1},
++        .mipLevels = 1,
++        .arrayLayers = 1,
++        .samples = VK_SAMPLE_COUNT_1_BIT,
++        .tiling = VK_IMAGE_TILING_OPTIMAL,
++        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++        .queueFamilyIndexCount = 0,
++        .pQueueFamilyIndices = nullptr,
++        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++    };
++    VkImage image = VK_NULL_HANDLE;
++    if (vk->vkCreateImage(mDevice, &createInfo, nullptr, &image) != VK_SUCCESS) {
++        GFXSTREAM_ERROR("Kolibri: vkCreateImage from IOSurface failed");
++        return VK_NULL_HANDLE;
++    }
++    // MoltenVK backs the image with the IOSurface; the binding is still required by the API.
++    VkMemoryRequirements reqs;
++    vk->vkGetImageMemoryRequirements(mDevice, image, &reqs);
++    const VkMemoryAllocateInfo allocInfo = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++        .pNext = nullptr,
++        .allocationSize = reqs.size,
++        .memoryTypeIndex = getValidMemoryTypeIndex(reqs.memoryTypeBits,
++                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
++    };
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    if (vk->vkAllocateMemory(mDevice, &allocInfo, nullptr, &memory) != VK_SUCCESS ||
++        vk->vkBindImageMemory(mDevice, image, memory, 0) != VK_SUCCESS) {
++        GFXSTREAM_ERROR("Kolibri: memory for IOSurface image failed");
++        if (memory) vk->vkFreeMemory(mDevice, memory, nullptr);
++        vk->vkDestroyImage(mDevice, image, nullptr);
++        return VK_NULL_HANDLE;
++    }
++    *outMemory = memory;
++    return image;
++}
++
++void VkEmulation::destroyIOSurfaceImage(VkImage image, VkDeviceMemory memory) {
++    auto vk = mDvk;
++    std::lock_guard<std::mutex> lock(mMutex);
++    if (image) vk->vkDestroyImage(mDevice, image, nullptr);
++    if (memory) vk->vkFreeMemory(mDevice, memory, nullptr);
++}
++
++bool VkEmulation::blitColorBufferToImage(uint32_t colorBufferHandle, VkImage dst,
++                                         VkImageLayout* dstLayout, uint32_t dstWidth,
++                                         uint32_t dstHeight) {
++    auto vk = mDvk;
++    std::lock_guard<std::mutex> lock(mMutex);
++    auto colorBufferInfo = gfxstream::base::find(mColorBuffers, colorBufferHandle);
++    if (!colorBufferInfo || !colorBufferInfo->image) return false;
++    const VkFormat srcFormat = colorBufferInfo->imageCreateInfoShallow.format;
++    if (getFormatAspects(srcFormat) != VK_IMAGE_ASPECT_COLOR_BIT) return false;
++    const VkExtent3D srcExtent = colorBufferInfo->imageCreateInfoShallow.extent;
++
++    if (colorBufferInfo->currentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
++        colorBufferInfo->currentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    }
++    const VkImageLayout srcLayout = colorBufferInfo->currentLayout;
++    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++
++    const VkCommandBufferBeginInfo beginInfo = {
++        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++        .pNext = nullptr,
++        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++        .pInheritanceInfo = nullptr,
++    };
++    VK_CHECK(vk->vkBeginCommandBuffer(mCommandBuffer, &beginInfo));
++    const VkImageMemoryBarrier before[2] = {
++        {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++            .oldLayout = srcLayout,
++            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = colorBufferInfo->image,
++            .subresourceRange = range,
++        },
++        {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = 0,
++            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,  // fully overwritten
++            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = dst,
++            .subresourceRange = range,
++        },
++    };
++    vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
++                             before);
++    const VkImageBlit region = {
++        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++        .srcOffsets = {{0, 0, 0}, {(int32_t)srcExtent.width, (int32_t)srcExtent.height, 1}},
++        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++        .dstOffsets = {{0, 0, 0}, {(int32_t)dstWidth, (int32_t)dstHeight, 1}},
++    };
++    vk->vkCmdBlitImage(mCommandBuffer, colorBufferInfo->image,
++                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
++                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
++    const VkImageMemoryBarrier after = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++        .dstAccessMask = VK_ACCESS_NONE_KHR,
++        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++        .newLayout = srcLayout,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image = colorBufferInfo->image,
++        .subresourceRange = range,
++    };
++    if (srcLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
++        vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
++                                 1, &after);
++    }
++    VK_CHECK(vk->vkEndCommandBuffer(mCommandBuffer));
++    const VkSubmitInfo submitInfo = {
++        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++        .pNext = nullptr,
++        .waitSemaphoreCount = 0,
++        .pWaitSemaphores = nullptr,
++        .pWaitDstStageMask = nullptr,
++        .commandBufferCount = 1,
++        .pCommandBuffers = &mCommandBuffer,
++        .signalSemaphoreCount = 0,
++        .pSignalSemaphores = nullptr,
++    };
++    {
++        gfxstream::base::AutoLock queueLock(*mQueueLock);
++        VK_CHECK(vk->vkQueueSubmit(mQueue, 1, &submitInfo, mCommandBufferFence));
++    }
++    const VkResult waitRes =
++        vk->vkWaitForFences(mDevice, 1, &mCommandBufferFence, VK_TRUE, UINT64_MAX);
++    VK_CHECK(vk->vkResetFences(mDevice, 1, &mCommandBufferFence));
++    *dstLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    return waitRes == VK_SUCCESS;
++}
++#endif  // __APPLE__
++
+ bool VkEmulation::clearColorBuffer(uint32_t colorBufferHandle) {
+     std::lock_guard<std::mutex> lock(mMutex);
+ 
+diff --git a/host/vulkan/vk_common_operations.h b/host/vulkan/vk_common_operations.h
+index 27a8479..570588b 100644
+--- a/host/vulkan/vk_common_operations.h
++++ b/host/vulkan/vk_common_operations.h
+@@ -416,6 +416,18 @@ class VkEmulation {
+                                     uint32_t h, const void* pixels);
+     bool clearColorBuffer(uint32_t colorBufferHandle);
+ 
++#if defined(__APPLE__)
++    // Kolibri: zero-copy frame delivery. A VkImage aliasing an IOSurface (VK_EXT_metal_objects)
++    // that the frontend samples directly, and a GPU blit of a ColorBuffer into it.
++    VkImage createImageFromIOSurface(IOSurfaceRef surface, uint32_t width, uint32_t height,
++                                     VkFormat format, VkDeviceMemory* outMemory);
++    void destroyIOSurfaceImage(VkImage image, VkDeviceMemory memory);
++    // Blits ColorBuffer `colorBufferHandle` into `dst` (scaled to dstWidth x dstHeight) and
++    // waits for the GPU. `dstLayout` tracks the destination image layout across calls.
++    bool blitColorBufferToImage(uint32_t colorBufferHandle, VkImage dst, VkImageLayout* dstLayout,
++                                uint32_t dstWidth, uint32_t dstHeight);
++#endif
++
+     // Data buffer operations
+     bool getBufferAllocationInfo(uint32_t bufferHandle, VkDeviceSize* outSize,
+                                  uint32_t* outMemoryTypeIndex, bool* outMemoryIsDedicatedAlloc);

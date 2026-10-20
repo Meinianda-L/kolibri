@@ -1,0 +1,6 @@
+/src/
+/out/
+.jdk/
+.jdk.tmp/
+build.log
+.gradle-home/

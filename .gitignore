@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# SwiftPM / Xcode build output and local state
+app/.build/
+app/build/
+app/.swiftpm/
+*.xcuserdata/
+
+# Python
+__pycache__/
+*.pyc

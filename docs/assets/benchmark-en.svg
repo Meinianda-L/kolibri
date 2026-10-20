@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="482" viewBox="0 0 880 482" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Helvetica Neue',Arial,sans-serif">
+<rect x="1" y="1" width="878" height="480" rx="16" fill="#ffffff" stroke="#e5e7eb"/>
+<text x="32" y="46" font-size="24" font-weight="800" fill="#111827">Kolibri vs. Android Emulator</text>
+<text x="32" y="72" font-size="14" fill="#6b7280">Same Apple Silicon Mac · higher is better</text>
+<rect x="540" y="32" width="14" height="14" rx="3" fill="#14b8a6"/><text x="560" y="44" font-size="14" fill="#374151">Kolibri</text>
+<rect x="630" y="32" width="14" height="14" rx="3" fill="#9ca3af"/><text x="650" y="44" font-size="14" fill="#374151">Android Emulator (default)</text>
+<text x="32" y="130" font-size="17" font-weight="600" fill="#111827">Naruto Mobile</text>
+<rect x="230" y="100" width="260" height="26" rx="6" fill="#14b8a6"/>
+<text x="500" y="119" font-size="15" font-weight="700" fill="#0f766e">60 fps, steady</text>
+<rect x="230" y="134" width="173" height="26" rx="6" fill="#9ca3af" opacity=".35"/>
+<rect x="230" y="134" width="130" height="26" rx="6" fill="#9ca3af"/>
+<text x="413" y="153" font-size="15" font-weight="600" fill="#4b5563">30–40 fps</text>
+<text x="32" y="214" font-size="17" font-weight="600" fill="#111827">SuperTuxKart</text>
+<rect x="230" y="184" width="494" height="26" rx="6" fill="#14b8a6"/>
+<text x="734" y="203" font-size="15" font-weight="700" fill="#0f766e">114 fps</text>
+<rect x="230" y="218" width="269" height="26" rx="6" fill="#9ca3af"/>
+<text x="509" y="237" font-size="15" font-weight="600" fill="#4b5563">62 fps</text>
+<text x="32" y="298" font-size="17" font-weight="600" fill="#111827">Luanti</text>
+<rect x="230" y="268" width="160" height="26" rx="6" fill="#14b8a6"/>
+<text x="400" y="287" font-size="15" font-weight="700" fill="#0f766e">37 fps</text>
+<rect x="230" y="302" width="98" height="26" rx="6" fill="#9ca3af"/>
+<text x="338" y="321" font-size="15" font-weight="600" fill="#4b5563">22.5 fps</text>
+<text x="32" y="382" font-size="17" font-weight="600" fill="#111827">Max refresh</text>
+<rect x="230" y="352" width="520" height="26" rx="6" fill="#14b8a6"/>
+<text x="760" y="371" font-size="15" font-weight="700" fill="#0f766e">120 Hz</text>
+<rect x="230" y="386" width="260" height="26" rx="6" fill="#9ca3af"/>
+<text x="500" y="405" font-size="15" font-weight="600" fill="#4b5563">60 Hz</text>
+<text x="32" y="464" font-size="12" fill="#9ca3af">Naruto Mobile: measured in play. SuperTuxKart (race) and Luanti (heavy scene): same phone image, 2560×1440, SurfaceFlinger frame stats.</text>
+</svg>

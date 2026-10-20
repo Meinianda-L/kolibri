@@ -1,0 +1,28 @@
+diff --git a/lawnchair/AndroidManifest.xml b/lawnchair/AndroidManifest.xml
+index fed6188..5084535 100644
+--- a/lawnchair/AndroidManifest.xml
++++ b/lawnchair/AndroidManifest.xml
+@@ -79,6 +79,23 @@
+             android:name="app.lawnchair.BlankActivity"
+             android:theme="@style/Theme.Transparent" />
+ 
++        <!-- Kolibri: "Tutorial" icon on the default home screen (hidden from the drawer) -->
++        <activity
++            android:name="app.lawnchair.kolibri.TutorialActivity"
++            android:exported="true"
++            android:excludeFromRecents="true"
++            android:noHistory="true"
++            android:taskAffinity=""
++            android:label="@string/kolibri_tutorial_title"
++            android:icon="@mipmap/ic_kolibri_tutorial_launcher"
++            android:roundIcon="@mipmap/ic_kolibri_tutorial_launcher"
++            android:theme="@android:style/Theme.NoDisplay">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
++
+         <activity
+             android:name="app.lawnchair.smartspace.SmartspacePreferencesShortcut"
+             android:theme="@style/Theme.Transparent" />

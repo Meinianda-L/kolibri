@@ -1,0 +1,84 @@
+diff --git a/lawnchair/res/values/config.xml b/lawnchair/res/values/config.xml
+index a5ab4bc..4d3c0b6 100644
+--- a/lawnchair/res/values/config.xml
++++ b/lawnchair/res/values/config.xml
+@@ -57,6 +57,8 @@
+         <item>com.google.android.as/com.google.android.apps.miphone.aiai.allapps.main.MainDummyActivity</item>
+         <!-- Lawnchair -->
+         <item>@string/launcher_component</item>
++        <!-- Kolibri: the Tutorial icon lives on the home screen only -->
++        <item>dev.kolibri.launcher/app.lawnchair.kolibri.TutorialActivity</item>
+     </string-array>
+ 
+     <dimen name="page_indicator_dot_size_v2">6dp</dimen>
+@@ -91,7 +93,7 @@
+     <string name="config_default_smartspace_time_format" translatable="false">system</string>
+ 
+     <!-- which hotseat mode to use by default -->
+-    <string name="config_default_hotseat_mode" translatable="false">lawnchair</string>
++    <string name="config_default_hotseat_mode" translatable="false">disabled</string>
+ 
+     <!-- which web search provider to use by default -->
+     <string name="config_default_web_suggestion_provider" translatable="false">google</string>
+@@ -137,7 +139,7 @@
+     <bool name="config_default_show_icon_labels_on_home_screen">true</bool>
+     <bool name="config_default_show_icon_labels_in_drawer">true</bool>
+     <bool name="config_default_enable_fuzzy_search">false</bool>
+-    <bool name="config_default_enable_smartspace">true</bool>
++    <bool name="config_default_enable_smartspace">false</bool>
+     <bool name="config_default_enable_feed">false</bool>
+     <bool name="config_default_enable_icon_selection">false</bool>
+     <bool name="config_default_show_component_names">false</bool>
+@@ -167,7 +169,7 @@
+     <item name="config_default_settings_entry_max_result_count" type="dimen" format="integer">5</item>
+     <item name="config_default_recent_max_result_count" type="dimen" format="integer">2</item>
+     <item name="config_default_max_web_suggestion_delay" type="dimen" format="integer">1000</item>
+-    <item name="config_default_hotseat_bottom_factor" type="dimen" format="float">1.0</item>
++    <item name="config_default_hotseat_bottom_factor" type="dimen" format="float">0.5</item>
+ 
+ 
+     <!-- The max scale for the wallpaper when it's zoomed in -->
+diff --git a/lawnchair/res/xml/device_profiles.xml b/lawnchair/res/xml/device_profiles.xml
+index 4e15c83..85b7393 100644
+--- a/lawnchair/res/xml/device_profiles.xml
++++ b/lawnchair/res/xml/device_profiles.xml
+@@ -60,8 +60,22 @@
+         launcher:numExtendedHotseatIcons="6"
+         launcher:devicePaddingId="@xml/paddings_4x5"
+         launcher:inlineNavButtonsEndSpacing="@dimen/taskbar_button_margin_split"
+-        launcher:defaultLayoutId="@xml/default_workspace_4x5"
+-        launcher:deviceCategory="phone|multi_display" >
++        launcher:defaultLayoutId="@xml/default_workspace_4x5_kolibri"
++        launcher:deviceCategory="phone|multi_display|tablet" >
++
++        <!-- Kolibri: guest display is landscape 1600x900 @ 320dpi (800x450dp).
++             4_by_5 is the first grid matching Lawnchair's default 4x5/4 grid prefs,
++             so it is the default; enabling it for "tablet" keeps it the default if
++             the guest display is configured at >= 600dp smallest width. -->
++        <display-option
++            launcher:name="Kolibri Landscape"
++            launcher:minWidthDps="450"
++            launcher:minHeightDps="800"
++            launcher:iconImageSize="44"
++            launcher:iconTextSize="13.0"
++            launcher:allAppsBorderSpace="16"
++            launcher:allAppsCellHeight="104"
++            launcher:canBeDefault="true" />
+ 
+         <display-option
+             launcher:name="Short Stubby"
+diff --git a/src/com/android/launcher3/DeviceProfile.java b/src/com/android/launcher3/DeviceProfile.java
+index 26f657b..21730fa 100644
+--- a/src/com/android/launcher3/DeviceProfile.java
++++ b/src/com/android/launcher3/DeviceProfile.java
+@@ -2530,7 +2530,9 @@ public class DeviceProfile {
+                 throw new IllegalArgumentException("Window bounds not set");
+             }
+             if (mTransposeLayoutWithOrientation == null) {
+-                mTransposeLayoutWithOrientation = !mInfo.isTablet(mWindowBounds);
++                // Kolibri: the guest is a landscape phone-sized display; keep the hotseat as a
++                // dock along the bottom instead of a vertical bar on the side.
++                mTransposeLayoutWithOrientation = false;
+             }
+             if (mIsGestureMode == null) {
+                 mIsGestureMode = mInfo.getNavigationMode().hasGestures;

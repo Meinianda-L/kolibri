@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Game Center</string>
+    <string name="tab_my_games">My games</string>
+    <string name="tab_all_apps">All apps</string>
+    <string name="tab_performance">Performance</string>
+    <string name="install_apk">Install APK</string>
+    <string name="loading">Scanning installed apps…</string>
+
+    <string name="games_count">%1$d games</string>
+    <string name="apps_count">%1$d apps · long-press to add to My games</string>
+    <string name="empty_title">No games yet</string>
+    <string name="empty_body">1. Tap \"Install APK\" on the left and pick a game package (.apk).\n2. Installed games are detected automatically and appear here.\n3. Not detected? Long-press it under \"All apps\" and choose \"Add to My games\".\n4. Long-press a game here for app info or to uninstall.</string>
+    <string name="empty_action">Install an APK from files</string>
+
+    <string name="menu_launch">Launch</string>
+    <string name="menu_add_to_games">Add to My games</string>
+    <string name="menu_remove_from_games">Remove from My games</string>
+    <string name="menu_app_info">App info</string>
+    <string name="menu_uninstall">Uninstall</string>
+    <string name="badge_pinned">Pinned</string>
+    <string name="cannot_launch">Can\'t launch %1$s</string>
+
+    <string name="install_need_permission">Allow Game Center to install unknown apps, then try again</string>
+    <string name="install_copying">Preparing package…</string>
+    <string name="install_success">Installed</string>
+    <string name="install_failed">Install failed: %1$s</string>
+    <string name="install_aborted">Install cancelled</string>
+    <string name="no_picker">No document picker available</string>
+
+    <string name="perf_device">Device</string>
+    <string name="perf_model">Model</string>
+    <string name="perf_brand">Brand / manufacturer</string>
+    <string name="perf_android">Android version</string>
+    <string name="perf_abi">CPU ABI</string>
+    <string name="perf_cores">CPU cores</string>
+    <string name="perf_memory">Memory</string>
+    <string name="perf_display">Display</string>
+    <string name="perf_refresh">Current refresh rate</string>
+    <string name="perf_resolution">Resolution</string>
+    <string name="perf_modes">Supported display modes</string>
+    <string name="perf_requested">Mode requested by this window</string>
+    <string name="perf_requested_none">System default</string>
+    <string name="perf_max_refresh">Request highest refresh rate</string>
+    <string name="perf_reset">Reset</string>
+    <string name="perf_note">Demo: affects only the Game Center window (WindowManager.LayoutParams.preferredDisplayModeId). With a single display mode the refresh rate won\'t change.</string>
+</resources>

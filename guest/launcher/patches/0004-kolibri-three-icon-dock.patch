@@ -1,0 +1,24 @@
+diff --git a/lawnchair/res/xml/device_profiles.xml b/lawnchair/res/xml/device_profiles.xml
+--- a/lawnchair/res/xml/device_profiles.xml
++++ b/lawnchair/res/xml/device_profiles.xml
+@@ -56,7 +56,7 @@
+         launcher:numColumns="4"
+         launcher:numFolderRows="3"
+         launcher:numFolderColumns="3"
+-        launcher:numHotseatIcons="4"
++        launcher:numHotseatIcons="3"
+         launcher:numExtendedHotseatIcons="6"
+         launcher:devicePaddingId="@xml/paddings_4x5"
+         launcher:inlineNavButtonsEndSpacing="@dimen/taskbar_button_margin_split"
+diff --git a/lawnchair/src/app/lawnchair/preferences/PreferenceManager.kt b/lawnchair/src/app/lawnchair/preferences/PreferenceManager.kt
+--- a/lawnchair/src/app/lawnchair/preferences/PreferenceManager.kt
++++ b/lawnchair/src/app/lawnchair/preferences/PreferenceManager.kt
+@@ -49,7 +49,7 @@
+     val transparentIconBackground = BoolPref("prefs_transparentIconBackground", false, recreate)
+     val shadowBGIcons = BoolPref("pref_shadowBGIcons", true, recreate)
+     val addIconToHome = BoolPref("pref_add_icon_to_home", true)
+-    val hotseatColumns = IntPref("pref_hotseatColumns", 4, reloadGrid)
++    val hotseatColumns = IntPref("pref_hotseatColumns", 3, reloadGrid)
+     val workspaceColumns = IntPref("pref_workspaceColumns", 4)
+     val workspaceRows = IntPref("pref_workspaceRows", 5)
+     val workspaceIncreaseMaxGridSize = BoolPref("pref_workspace_increase_max_grid_size", false)

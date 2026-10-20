@@ -1,0 +1,16 @@
+{
+  "title": "荣耀 Magic6 Pro",
+  "title_en": "Honor Magic6 Pro",
+  "brand": "HONOR",
+  "manufacturer": "HONOR",
+  "model": "BVL-AN00",
+  "device": "HNBVL",
+  "product": "BVL-AN00",
+  "board": "pineapple",
+  "platform": "pineapple",
+  "hardware": "qcom",
+  "soc_manufacturer": "QTI",
+  "soc_model": "SM8650",
+  "gpu_renderer": "Adreno (TM) 750",
+  "refresh_hz": 120
+}

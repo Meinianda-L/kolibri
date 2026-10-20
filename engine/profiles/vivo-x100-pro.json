@@ -1,0 +1,16 @@
+{
+  "title": "vivo X100 Pro",
+  "title_en": "vivo X100 Pro",
+  "brand": "vivo",
+  "manufacturer": "vivo",
+  "model": "V2324A",
+  "device": "PD2324",
+  "product": "PD2324",
+  "board": "k6989v1_64",
+  "platform": "mt6989",
+  "hardware": "mt6989",
+  "soc_manufacturer": "Mediatek",
+  "soc_model": "MT6989",
+  "gpu_renderer": "Mali-G720-Immortalis MC12",
+  "refresh_hz": 120
+}

@@ -1,0 +1,16 @@
+{
+  "title": "ROG Phone 8 Pro（游戏旗舰）",
+  "title_en": "ROG Phone 8 Pro (gaming flagship)",
+  "brand": "asus",
+  "manufacturer": "asus",
+  "model": "ASUS_AI2401",
+  "device": "ASUS_AI2401",
+  "product": "WW_AI2401",
+  "board": "pineapple",
+  "hardware": "qcom",
+  "platform": "pineapple",
+  "refresh_hz": 120,
+  "soc_manufacturer": "QTI",
+  "soc_model": "SM8650",
+  "gpu_renderer": "Adreno (TM) 750"
+}

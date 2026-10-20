@@ -1,0 +1,16 @@
+{
+  "title": "OPPO Find X7 Ultra",
+  "title_en": "OPPO Find X7 Ultra",
+  "brand": "OPPO",
+  "manufacturer": "OPPO",
+  "model": "PHY110",
+  "device": "OP5D3BL1",
+  "product": "PHY110",
+  "board": "pineapple",
+  "platform": "pineapple",
+  "hardware": "qcom",
+  "soc_manufacturer": "QTI",
+  "soc_model": "SM8650",
+  "gpu_renderer": "Adreno (TM) 750",
+  "refresh_hz": 120
+}

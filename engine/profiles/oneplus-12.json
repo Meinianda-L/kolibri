@@ -1,0 +1,16 @@
+{
+  "title": "一加 12",
+  "title_en": "OnePlus 12",
+  "brand": "OnePlus",
+  "manufacturer": "OnePlus",
+  "model": "PJD110",
+  "device": "OP595DL1",
+  "product": "PJD110",
+  "board": "pineapple",
+  "hardware": "qcom",
+  "platform": "pineapple",
+  "refresh_hz": 120,
+  "soc_manufacturer": "QTI",
+  "soc_model": "SM8650",
+  "gpu_renderer": "Adreno (TM) 750"
+}

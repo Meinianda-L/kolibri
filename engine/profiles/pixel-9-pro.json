@@ -1,0 +1,16 @@
+{
+  "title": "Google Pixel 9 Pro",
+  "title_en": "Google Pixel 9 Pro",
+  "brand": "google",
+  "manufacturer": "Google",
+  "model": "Pixel 9 Pro",
+  "device": "caiman",
+  "product": "caiman",
+  "board": "caiman",
+  "hardware": "caiman",
+  "platform": "zumapro",
+  "refresh_hz": 120,
+  "soc_manufacturer": "Google",
+  "soc_model": "Tensor G4",
+  "gpu_renderer": "Mali-G715"
+}

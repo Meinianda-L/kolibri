@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""kolibribench - same-method performance measurement for any Android emulator.
+
+Works on Kolibri instances and anything else adb can reach, so both
+are measured identically:
+
+  kolibribench glmark2  <serial> [--pid HOSTPID]       GPU benchmark (score + per-scene FPS)
+  kolibribench frames   <serial> --seconds 60 [--layer substr] [--pid HOSTPID]
+                                                     frame pacing of whatever is on screen
+                                                     (SurfaceFlinger timestats: avg FPS,
+                                                     frame-time P50/P90/P99, jank %)
+
+--pid samples the emulator's host process (CPU %, phys_footprint) during the run.
+Results are also appended as JSON lines to ~/.kolibri/bench/results.jsonl.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+SDK = Path(os.environ.get("ANDROID_SDK_ROOT") or Path.home() / "Library/Android/sdk")
+ADB = str(SDK / "platform-tools/adb")
+OUT = Path.home() / ".kolibri/bench"
+
+
+def sh(serial: str, cmd: str, timeout: float = 60) -> str:
+    r = subprocess.run([ADB, "-s", serial, "shell", cmd], capture_output=True, text=True, timeout=timeout)
+    return r.stdout
+
+
+class HostSampler:
+    """Samples host CPU% and phys_footprint of the emulator process."""
+
+    def __init__(self, pid: int | None):
+        self.pid, self.cpu, self.mem, self._stop = pid, [], [], threading.Event()
+        self.t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            r = subprocess.run(["ps", "-o", "%cpu=", "-p", str(self.pid)], capture_output=True, text=True)
+            if r.stdout.strip():
+                self.cpu.append(float(r.stdout.strip()))
+            f = subprocess.run(["footprint", "-p", str(self.pid)], capture_output=True, text=True).stdout
+            m = re.search(r"phys_footprint:\s+(\d+)\s*MB", f)
+            if m:
+                self.mem.append(int(m.group(1)))
+            self._stop.wait(2)
+
+    def __enter__(self):
+        if self.pid:
+            self.t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+
+    def summary(self) -> dict:
+        if not self.cpu:
+            return {}
+        return {"host_cpu_avg_pct": round(statistics.mean(self.cpu), 1),
+                "host_cpu_max_pct": round(max(self.cpu), 1),
+                "host_mem_avg_mb": round(statistics.mean(self.mem)) if self.mem else None,
+                "host_mem_max_mb": max(self.mem) if self.mem else None}
+
+
+def record(result: dict) -> None:
+    OUT.mkdir(parents=True, exist_ok=True)
+    with (OUT / "results.jsonl").open("a") as f:
+        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def device_info(serial: str) -> dict:
+    return {
+        "serial": serial,
+        "model": sh(serial, "getprop ro.product.model").strip(),
+        "android": sh(serial, "getprop ro.build.version.release").strip(),
+        "screen": sh(serial, "wm size").strip().split(":")[-1].strip(),
+        "gl_renderer": sh(serial, "dumpsys SurfaceFlinger | grep -m1 GLES").strip()[:120],
+    }
+
+
+# ---------------------------------------------------------------- glmark2
+
+def cmd_glmark2(a: argparse.Namespace) -> None:
+    s = a.serial
+    sh(s, "logcat -c")
+    sh(s, "am force-stop org.linaro.glmark2")
+    extra = f' -e args "{a.args}"' if a.args else ""
+    sh(s, f"am start -n org.linaro.glmark2/.Glmark2Activity{extra}")
+    t0 = time.time()
+    scenes, score = [], None
+    with HostSampler(a.pid) as hs:
+        while time.time() - t0 < a.timeout:
+            log = subprocess.run([ADB, "-s", s, "logcat", "-d", "-s", "glmark2:I", "glmark2:D", "glmark2:V"],
+                                 capture_output=True, text=True).stdout
+            m = re.search(r"glmark2 Score:\s*(\d+)", log)
+            if m:
+                score = int(m.group(1))
+                seen = {}
+                for x in re.finditer(r"\[(\w+)\]\s*(.*?)\s*FPS: (\d+) FrameTime: ([\d.]+) ms", log):
+                    name = x.group(1) + ("" if x.group(2) in ("<default>", "") else " " + x.group(2))
+                    seen[name] = (name, int(x.group(3)), float(x.group(4)))
+                scenes = list(seen.values())
+                break
+            time.sleep(3)
+    if score is None:
+        sys.exit("glmark2 did not finish (no score in logcat)")
+    record({"test": "glmark2", "label": a.label, "time": int(t0), **device_info(s), "score": score,
+            "duration_s": round(time.time() - t0), "scenes": [{"scene": n, "fps": f, "frame_ms": ft} for n, f, ft in scenes],
+            **hs.summary()})
+
+
+# ---------------------------------------------------------------- frame pacing
+
+def parse_timestats(dump: str, layer_filter: str | None) -> dict | None:
+    """Pick the busiest matching layer and compute pacing stats from its
+    present-to-present histogram (ms buckets)."""
+    best = None
+    for block in re.split(r"\n(?=layerName = )", dump):
+        m = re.match(r"layerName = (.+)", block)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if layer_filter and layer_filter not in name:
+            continue
+        frames = re.search(r"totalFrames = (\d+)", block)
+        avg = re.search(r"averageFPS = ([\d.]+)", block)
+        hist = re.search(r"present2present histogram is as below:\n(.+?)\n", block)
+        if not frames or not hist:
+            continue
+        buckets = [(int(k), int(v)) for k, v in re.findall(r"(\d+)ms=(\d+)", hist.group(1))]
+        n = int(frames.group(1))
+        if best is None or n > best["frames"]:
+            best = {"layer": name, "frames": n, "avg_fps": float(avg.group(1)) if avg else None, "buckets": buckets}
+    if not best:
+        return None
+    total = sum(c for _, c in best["buckets"]) or 1
+
+    def pct(p: float) -> int:
+        acc = 0
+        for ms, c in sorted(best["buckets"]):
+            acc += c
+            if acc / total >= p:
+                return ms
+        return best["buckets"][-1][0]
+
+    p50 = pct(0.5)
+    jank = sum(c for ms, c in best["buckets"] if ms > max(2 * p50, 20)) / total
+    best.update(frame_ms_p50=p50, frame_ms_p90=pct(0.9), frame_ms_p99=pct(0.99), jank_pct=round(100 * jank, 2))
+    del best["buckets"]
+    return best
+
+
+def cmd_frames(a: argparse.Namespace) -> None:
+    s = a.serial
+    sh(s, "dumpsys SurfaceFlinger --timestats -disable -clear")
+    sh(s, "dumpsys SurfaceFlinger --timestats -enable -clear")
+    t0 = time.time()
+    with HostSampler(a.pid) as hs:
+        time.sleep(a.seconds)
+    dump = sh(s, "dumpsys SurfaceFlinger --timestats -dump -maxlayers 20", timeout=60)
+    sh(s, "dumpsys SurfaceFlinger --timestats -disable")
+    stats = parse_timestats(dump, a.layer)
+    if not stats:
+        sys.exit("no layer frames captured (is something animating on screen?)")
+    record({"test": "frames", "label": a.label, "time": int(t0), **device_info(s),
+            "seconds": a.seconds, **stats, **hs.summary()})
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="kolibribench")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("glmark2")
+    g.add_argument("serial")
+    g.add_argument("--args", default="", help="glmark2 command line, e.g. '-b terrain -b jellyfish'")
+    g.add_argument("--timeout", type=float, default=900)
+    g.add_argument("--pid", type=int)
+    g.add_argument("--label", default="")
+    g.set_defaults(fn=cmd_glmark2)
+    f = sub.add_parser("frames")
+    f.add_argument("serial")
+    f.add_argument("--seconds", type=float, default=60)
+    f.add_argument("--layer", help="substring of the layer to measure (default: busiest layer)")
+    f.add_argument("--pid", type=int)
+    f.add_argument("--label", default="")
+    f.set_defaults(fn=cmd_frames)
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

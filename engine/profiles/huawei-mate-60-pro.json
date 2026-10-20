@@ -1,0 +1,16 @@
+{
+  "title": "华为 Mate 60 Pro",
+  "title_en": "Huawei Mate 60 Pro",
+  "brand": "HUAWEI",
+  "manufacturer": "HUAWEI",
+  "model": "ALN-AL00",
+  "device": "HWALN",
+  "product": "ALN-AL00",
+  "board": "ALN",
+  "platform": "kirin9000s",
+  "hardware": "kirin9000s",
+  "soc_manufacturer": "HiSilicon",
+  "soc_model": "Kirin 9000S",
+  "gpu_renderer": "Maleoon 910",
+  "refresh_hz": 120
+}

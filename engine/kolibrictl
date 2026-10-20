@@ -1,0 +1,1649 @@
+#!/usr/bin/env python3
+"""kolibrictl - Kolibri instance manager.
+
+Wraps the Android Emulator engine (QEMU + HVF + gfxstream) into game-tuned
+instances. Instances live in ~/.kolibri so they never mix with Android Studio
+AVDs. Stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ENGINE_DIR = Path(__file__).resolve().parent
+def _find_sdk() -> Path:
+    """An explicit ANDROID_SDK_ROOT/ANDROID_HOME, else Android Studio's SDK if it has the
+    emulator, else Kolibri's own (filled by `kolibrictl setup` on first launch)."""
+    env_sdk = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+    if env_sdk:
+        return Path(env_sdk)
+    studio = Path.home() / "Library/Android/sdk"
+    if (studio / "emulator/emulator").exists():
+        return studio
+    return Path(os.environ.get("KOLIBRI_HOME", Path.home() / ".kolibri")) / "sdk"
+
+
+SDK = _find_sdk()
+EMULATOR = SDK / "emulator/emulator"
+ADB = SDK / "platform-tools/adb"
+KOLIBRI_HOME = Path(os.environ.get("KOLIBRI_HOME", Path.home() / ".kolibri"))
+AVD_HOME = KOLIBRI_HOME / "avd"
+OLD_HOME = Path.home() / ".voltplay"   # the project's name before Kolibri
+
+
+def migrate_old_home() -> None:
+    """Move ~/.voltplay (instances, keymaps, recordings, logs) to ~/.kolibri once.
+    AVD .ini files hold absolute paths and every instance's metadata file was renamed;
+    the old path stays as a symlink so anything still pointing there keeps working."""
+    if KOLIBRI_HOME.exists() or not OLD_HOME.is_dir() or OLD_HOME.is_symlink():
+        return
+    for meta in OLD_HOME.glob("avd/*.avd/voltplay.json"):
+        pid = json.loads(meta.read_text()).get("pid")
+        if pid and pid_alive(pid):
+            die(f"{meta.parent.stem} is still running; stop it before the first Kolibri start")
+    OLD_HOME.rename(KOLIBRI_HOME)
+    OLD_HOME.symlink_to(KOLIBRI_HOME)
+    for ini in (KOLIBRI_HOME / "avd").glob("*.ini"):
+        ini.write_text(ini.read_text().replace(str(OLD_HOME), str(KOLIBRI_HOME)))
+    for meta in (KOLIBRI_HOME / "avd").glob("*.avd/voltplay.json"):
+        meta.rename(meta.with_name("kolibri.json"))
+    print(f"moved {OLD_HOME} -> {KOLIBRI_HOME}", file=sys.stderr)
+DEFAULT_IMAGE = "android-36/google_apis"   # Android 16, kernel 6.x; slimmed to Settings/Files/Browser
+
+
+def sysimg_rel(image: str) -> str:
+    api, tag = image.split("/")
+    return f"system-images/{api}/{tag}/arm64-v8a/"
+
+CONSOLE_BASE = 5554  # console = base + 2n, adb = console + 1
+GRPC_BASE = 8554     # grpc = base + n
+
+
+def die(msg: str) -> "NoReturn":  # type: ignore[name-defined]
+    print(f"kolibrictl: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def avd_dir(name: str) -> Path:
+    return AVD_HOME / f"{name}.avd"
+
+
+def meta_path(name: str) -> Path:
+    return avd_dir(name) / "kolibri.json"
+
+
+def load_meta(name: str) -> dict:
+    p = meta_path(name)
+    if not p.exists():
+        die(f"no such instance: {name}")
+    return json.loads(p.read_text())
+
+
+def save_meta(name: str, meta: dict) -> None:
+    meta_path(name).write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
+
+
+def instances() -> list[str]:
+    if not AVD_HOME.exists():
+        return []
+    return sorted(p.stem for p in AVD_HOME.glob("*.avd") if (p / "kolibri.json").exists())
+
+
+def port_free(port: int) -> bool:
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", port)) != 0
+
+
+def alloc_slot() -> int:
+    used = {load_meta(n)["slot"] for n in instances()}
+    for slot in range(0, 16):
+        if slot in used:
+            continue
+        if port_free(CONSOLE_BASE + 2 * slot) and port_free(GRPC_BASE + slot):
+            return slot
+    die("no free instance slot (max 16)")
+
+
+def env() -> dict:
+    e = dict(os.environ)
+    e["ANDROID_SDK_ROOT"] = str(SDK)
+    e["ANDROID_AVD_HOME"] = str(AVD_HOME)
+    return e
+
+
+def render_config(meta: dict) -> str:
+    tpl = (ENGINE_DIR / "avd_template/config.ini").read_text()
+    w, h = meta["resolution"]
+    return tpl.format(
+        name=meta["name"],
+        sysdir=sysimg_rel(meta.get("image", "android-36/google_apis")),
+        target=meta.get("image", "android-36/google_apis").split("/")[0],
+        tag=meta.get("image", "android-36/google_apis").split("/")[1],
+        cores=meta["cores"],
+        ram=meta["ram_mb"],
+        width=w,
+        height=h,
+        dpi=meta["dpi"],
+        vsync=meta["refresh_hz"],
+        data_size=meta["data_gb"],
+    )
+
+
+def cmd_create(a: argparse.Namespace) -> None:
+    name = a.name
+    if not (SDK / sysimg_rel(a.image) / "system.img").exists():
+        die(f"system image missing: {SDK / sysimg_rel(a.image)} (sdkmanager --install 'system-images;{a.image.replace('/', ';')};arm64-v8a')")
+    if avd_dir(name).exists():
+        die(f"instance exists: {name}")
+    w, h = (int(x) for x in a.resolution.lower().split("x"))
+    meta = {
+        "name": name,
+        "slot": alloc_slot(),
+        "resolution": [w, h],
+        "dpi": a.dpi,
+        "cores": a.cores,
+        "ram_mb": a.ram,
+        "refresh_hz": a.refresh,
+        "data_gb": a.data,
+        "profile": a.profile,
+        "image": a.image,
+        "gms": a.gms,
+        "root": a.root,
+        "provisioned": False,
+        "created": int(time.time()),
+    }
+    avd_dir(name).mkdir(parents=True)
+    (avd_dir(name) / "config.ini").write_text(render_config(meta))
+    write_avd_ini(name, a.image)
+    save_meta(name, meta)
+    print(f"created {name} (slot {meta['slot']}, {w}x{h}@{a.refresh}Hz, {a.cores}c/{a.ram}MB, profile {a.profile})")
+
+
+def write_avd_ini(name: str, image: str) -> None:
+    (AVD_HOME / f"{name}.ini").write_text(
+        f"avd.ini.encoding=UTF-8\npath={avd_dir(name)}\npath.rel=avd/{name}.avd\ntarget={image.split('/')[0]}\n"
+    )
+
+
+def ports(meta: dict) -> tuple[int, int, int]:
+    console = CONSOLE_BASE + 2 * meta["slot"]
+    return console, console + 1, GRPC_BASE + meta["slot"]
+
+
+def serial(meta: dict) -> str:
+    return f"emulator-{ports(meta)[0]}"
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def running_pid(meta: dict) -> int | None:
+    pid = meta.get("pid")
+    return pid if pid and pid_alive(pid) else None
+
+
+def adb(meta: dict, *args: str, check: bool = True, capture: bool = True) -> str:
+    r = subprocess.run([str(ADB), "-s", serial(meta), *args], capture_output=capture, text=True, env=env())
+    if check and r.returncode != 0:
+        die(f"adb {' '.join(args)} failed: {r.stderr.strip()}")
+    return (r.stdout or "").strip()
+
+
+def wait_boot(meta: dict, timeout: float) -> float:
+    t0 = time.time()
+    subprocess.run([str(ADB), "-s", serial(meta), "wait-for-device"], env=env(), timeout=timeout)
+    while time.time() - t0 < timeout:
+        if adb(meta, "shell", "getprop", "sys.boot_completed", check=False) == "1":
+            return time.time() - t0
+        time.sleep(0.5)
+    die(f"boot timed out after {timeout:.0f}s")
+
+
+# Self-built engine (opt-in per instance: `kolibrictl set <name> engine=src`): the build
+# tree of ~/emulator-src (external/qemu, cmake.py --out objs-emu) is itself a runnable
+# engine layout; only these entries are cloned out of it (the rest is objects and tests).
+SRC_ENGINE = Path(os.environ.get("KOLIBRI_ENGINE_SRC", Path.home() / "emulator-src/objs-emu"))
+SRC_ENGINE_ENTRIES = ("emulator", "emulator-check", "qemu", "qemu-img", "lib", "lib64", "bin64",
+                      "resources", "crashpad_handler", "netsimd", "mksdcard", "source.properties")
+
+
+def engine_root(meta: dict) -> Path:
+    """The emulator directory to run: an APFS clone of the SDK's engine (no extra disk)
+    with Kolibri's shims in front of MoltenVK (GPU name for games) and, for host-GLES
+    instances, in front of ANGLE. The SDK itself is never modified.
+    engine=src instances run a clone of the engine built from source instead."""
+    from_src = meta.get("engine") == "src"
+    sdk_engine = SRC_ENGINE if from_src else SDK / "emulator"
+    clone = KOLIBRI_HOME / "engine" / ("emulator-src" if from_src else "emulator")
+    stamp = clone / ".kolibri-source"
+    # The shim tag forces a fresh clone when the shims change (e.g. env var names).
+    want = (sdk_engine / "source.properties").read_text() + "\nshims=kolibri-1\n"
+    if from_src:   # a rebuild keeps source.properties; key on the binaries instead
+        for f in ("qemu/darwin-aarch64/qemu-system-aarch64-headless", "lib64/libgfxstream_backend.dylib", "emulator"):
+            st = (sdk_engine / f).stat()
+            want += f"{f}={st.st_size}:{int(st.st_mtime)}\n"
+    if not stamp.exists() or stamp.read_text() != want:
+        if clone.exists():
+            shutil.rmtree(clone)
+        clone.parent.mkdir(parents=True, exist_ok=True)
+        if from_src:
+            clone.mkdir()
+            for e in SRC_ENGINE_ENTRIES:
+                if (sdk_engine / e).exists():
+                    subprocess.run(["cp", "-cR", str(sdk_engine / e), str(clone / e)], check=True)
+        else:
+            subprocess.run(["cp", "-cR", str(sdk_engine), str(clone)], check=True)   # APFS clone
+        subprocess.run(["bash", str(ENGINE_DIR / "glshim/build_vk.sh"), str(clone / "lib64/vulkan")], check=True)
+        stamp.write_text(want)
+    if meta.get("host_gles") and not (clone / "lib64/gles_angle/real/angle_GLESv2.dylib").exists():
+        subprocess.run(["bash", str(ENGINE_DIR / "glshim/build.sh"), str(clone / "lib64/gles_angle")], check=True,
+                       env={**os.environ, "ANGLE_SRC": str(sdk_engine / "lib64/gles_angle")})
+    return clone
+
+
+def engine_args(meta: dict, a: argparse.Namespace) -> list[str]:
+    console, _, grpc = ports(meta)
+    args = [
+        str(engine_root(meta) / "emulator"), "-avd", meta["name"],
+        "-port", str(console),
+        "-grpc", str(grpc),          # plain localhost gRPC (no JWT) for the frontend
+        "-gpu", meta.get("gpu", "host"),  # host | angle (host-side ANGLE -> Metal)
+        "-accel", "on",              # HVF
+        "-no-boot-anim",
+        "-netdelay", "none", "-netspeed", "full",
+        # (QuickbootFileBacked/OnDemandSnapshotLoad cut footprint to ~0.5GB but leave
+        # ram.img dirty on stop and break the next restore in engine 36.6: off for now.)
+        # AsyncComposeSupport: measured 61.2 -> 68.0 fps in STK (GLES via GuestAngle, display
+        # client attached). VulkanBatchedDescriptorSetUpdate added only +0.8 fps and crashes the
+        # engine on snapshot restore (FATAL VkDescriptorPool); VirtioGpuNativeSync breaks boot.
+        "-feature", "Vulkan,VulkanSnapshots,GLDirectMem,VirtioInput,HostComposition,AsyncComposeSupport,"
+                    "-BluetoothEmulation",
+    ]
+    if meta.get("guest_angle", True) and not meta.get("host_gles"):
+        # GLES through ANGLE in the guest -> Vulkan -> gfxstream -> MoltenVK -> Metal.
+        # The host GL translator caps at GLES 3.0 on macOS (OpenGL 4.1); games then
+        # fall back to legacy paths. ANGLE gives GLES 3.1/3.2.
+        args[args.index("-feature") + 1] += ",GuestAngle"
+    if meta.get("host_gles"):
+        # Host GLES: the guest's GLES goes to the host translator, which
+        # reports whatever GLES version host ANGLE supports.
+        args[args.index("-feature") + 1] += ",GLESDynamicVersion"
+    # Faster restores were tried and don't work on this engine: QuickbootFileBacked restores
+    # a frozen guest (adb offline, no frames) and OnDemandSnapshotLoad hangs in the load.
+    if meta.get("features"):
+        # Per-instance feature overrides, e.g. `kolibrictl set x features=GLESDynamicVersion,-AsyncComposeSupport`:
+        # "Name" adds a feature, "-Name" removes a default one.
+        i = args.index("-feature") + 1
+        feats = [f for f in args[i].split(",") if f]
+        for f in str(meta["features"]).split(","):
+            f = f.strip()
+            if not f:
+                continue
+            name = f.lstrip("-")
+            feats = [x for x in feats if x.lstrip("-") != name]
+            feats.append(f)
+        args[i] = ",".join(feats)
+    if meta.get("hidden_window"):
+        # The engine's own (Qt) window exists but stays hidden: GL surfaces get a real
+        # display scale, which host-side GL needs (with -no-window it renders 1/4 frames).
+        args.append("-qt-hide-window")
+    elif not a.window:
+        args.append("-no-window")
+    if a.cold:
+        args += ["-no-snapshot-load"]
+    if getattr(a, "wipe", False):
+        args += ["-wipe-data"]
+    if meta.get("phone_number"):
+        args += ["-phone-number", str(meta["phone_number"])]
+    if getattr(a, "writable_system", False) or meta.get("writable_system"):
+        args.append("-writable-system")
+    if meta.get("qemu_args"):
+        args += ["-qemu", *meta["qemu_args"]]  # must stay last: everything after -qemu goes to QEMU
+    return args
+
+
+def cmd_start(a: argparse.Namespace) -> None:
+    meta = load_meta(a.name)
+    if wait_stopping(a.name):
+        meta = load_meta(a.name)
+    if running_pid(meta):
+        print(f"{a.name} already running (pid {meta['pid']})")
+        return
+    log = avd_dir(a.name) / "engine.log"
+    t0 = time.time()
+    eng_env = env()
+    # Headless (-no-window) engines pick the "none" audio backend: the game is
+    # silent and nothing can be recorded. Use CoreAudio like a windowed engine.
+    eng_env.setdefault("QEMU_AUDIO_DRV", "coreaudio")
+    # On `emu kill` the engine saves the quickboot snapshot, but kills itself after 20 s by
+    # default; a 4 GB save can take longer, and a cut-short save means a slow cold boot next
+    # time. Give it room (stop no longer blocks the UI while it saves).
+    eng_env.setdefault("ANDROID_EMULATOR_WAIT_TIME_BEFORE_KILL", "120")
+    if meta.get("engine") == "src":
+        # 37.2's CoreAudio voice buffer is only a few periods long; at the default 100 Hz audio
+        # timer QEMU refilled ~6% of real time (choppy sound, near-empty gRPC audio stream).
+        eng_env.setdefault("QEMU_AUDIO_TIMER_PERIOD", "500")
+    # Guest ANGLE: clear attachments with a draw instead of vkCmdClearAttachments. Through
+    # gfxstream -> MoltenVK a depth clear inside a render pass is lost, so anything drawn
+    # after one (Luanti's wield hand, 3D inventory icons) fails the depth test and vanishes.
+    # The engine passes this to the guest as androidboot.hardware.angle_feature_overrides_enabled.
+    eng_env["ANGLE_FEATURE_OVERRIDES_ENABLED"] = meta.get("angle_enable", "preferDrawClearOverVkCmdClearAttachments")
+    if meta.get("host_angle_metal"):
+        # Host-side ANGLE on Metal: keep -gpu host (Vulkan on
+        # MoltenVK) but run the GLES translator on EGL-on-EGL backed by the engine's
+        # bundled ANGLE, steered to its Metal backend instead of macOS OpenGL 4.1.
+        angle = SDK / "emulator/lib64/gles_angle"
+        eng_env.update({"ANDROID_EGL_ON_EGL": "1", "ANDROID_EGL_LIB": str(angle / "libEGL.dylib"),
+                        "ANDROID_GLESv2_LIB": str(angle / "libGLESv2.dylib"), "ANGLE_DEFAULT_PLATFORM": "metal"})
+    # GPU name games see (Vulkan deviceName, and GL_RENDERER via guest ANGLE / host GLES).
+    gpu_prof = device_profile(meta)
+    # An empty gpu_renderer means "follow the phone model".
+    eng_env["KOLIBRI_GPU_RENDERER"] = meta.get("gpu_renderer") or gpu_prof.get("gpu_renderer") or "Adreno (TM) 750"
+    if meta.get("host_gles"):
+        # GLES layering with open-source parts: guest GLES -> gfxstream -> host ANGLE
+        # (Vulkan backend) -> MoltenVK -> Metal, through our shim (engine/glshim), which
+        # re-exports the engine's ANGLE and reports a phone GPU name to games.
+        prof = device_profile(meta)
+        renderer = meta.get("gpu_renderer") or prof.get("gpu_renderer") or "Adreno (TM) 750"
+        default_vendor = ("Qualcomm" if "Adreno" in renderer else "ARM" if "Mali" in renderer
+                          else "HUAWEI" if "Maleoon" in renderer else "Qualcomm")
+        eng_env.update({"ANDROID_EGL_ON_EGL": "1", "ANGLE_DEFAULT_PLATFORM": "vulkan",
+                        "KOLIBRI_GPU_RENDERER": renderer,
+                        "KOLIBRI_GPU_VENDOR": meta.get("gpu_vendor", prof.get("gpu_vendor", default_vendor))})
+        if meta.get("engine") == "src":
+            # The self-built gfxstream reports these to the guest driver itself
+            # (engine/src-patches/gfxstream.patch): ES 3.2 like other Mac emulators (the host context stays
+            # ES 3.1: ANGLE on MoltenVK has no geometry shaders) and a phone-style GL_VERSION
+            # without "ANGLE" in it.
+            gles_max = str(meta.get("gles_max", "3.2"))
+            driver = " V@0615.0" if "Adreno" in renderer else ""
+            eng_env.update({"KOLIBRI_GLES_MAX": gles_max,
+                            "KOLIBRI_GL_VERSION": meta.get("gl_version") or prof.get("gl_version")
+                            or f"OpenGL ES {gles_max}{driver}"})
+    # Zero-copy frames (self-built engine): gfxstream blits each posted frame into IOSurfaces
+    # and publishes them in this header; the frontend samples them instead of the gRPC stream.
+    iosurface_hdr = avd_dir(a.name) / "frame-iosurface.bin"
+    iosurface_hdr.unlink(missing_ok=True)
+    if meta.get("engine") == "src" and meta.get("iosurface", True):
+        eng_env["KOLIBRI_IOSURFACE_HEADER"] = str(iosurface_hdr)
+    eng_env.update({k: str(v) for k, v in meta.get("env", {}).items()})
+    proc = subprocess.Popen(
+        engine_args(meta, a), env=eng_env, stdout=log.open("w"), stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    meta["pid"] = proc.pid
+    save_meta(a.name, meta)
+    console, adbp, grpc = ports(meta)
+    print(f"starting {a.name}: pid {proc.pid}, serial {serial(meta)}, grpc 127.0.0.1:{grpc}, log {log}")
+    spawn_audio_watch(a.name)
+    if a.no_wait:
+        return
+    try:
+        # Snapshot restore: the guest is live (and gRPC frames/input work) as soon as
+        # the engine reports the load; adb reattaching takes ~10s more and isn't needed.
+        t_snap = time.time()
+        while not a.cold and time.time() - t_snap < 30 and proc.poll() is None:
+            text = log.read_text(errors="ignore")
+            if "Successfully loaded snapshot" in text:
+                print(f"{a.name} resumed from snapshot in {time.time() - t0:.1f}s")
+                return
+            if "Failed to load snapshot" in text or "Cold boot" in text:
+                break
+            time.sleep(0.05)
+        wait_boot(meta, a.timeout)
+        if load_meta(a.name).get("grow_fs"):
+            grow_data_fs(meta)
+    except SystemExit:
+        if proc.poll() is not None:
+            print(log.read_text()[-2000:], file=sys.stderr)
+        raise
+    print(f"{a.name} booted in {time.time() - t0:.1f}s")
+
+
+# --- Audio watchdog ----------------------------------------------------------
+# The guest audio HAL (ranchu, tinyalsa on virtio-snd) sometimes reopens its output
+# when a game starts and the new PCM stream never starts on the engine side: every
+# pcm_writei then fails with EIO and the game stays silent until it is restarted.
+# Restarting the audio HAL (audioserver follows) makes every AudioTrack reconnect.
+AUDIO_HAL_TAG = "android.hardware.audio@7.1-impl.ranchu"
+
+
+def spawn_audio_watch(name: str) -> None:
+    pidfile = avd_dir(name) / "audio-watch.pid"
+    try:
+        old = int(pidfile.read_text())
+        if pid_alive(old):
+            os.kill(old, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "audio-watch", name],
+                            stdin=subprocess.DEVNULL, stdout=(avd_dir(name) / "audio-watch.log").open("a"),
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    pidfile.write_text(str(proc.pid))
+
+
+def heal_audio(meta: dict) -> None:
+    was_root = adb(meta, "shell", "id", "-u", check=False) == "0"
+    if not was_root:
+        adb_retry(meta, "root")
+        subprocess.run([str(ADB), "-s", serial(meta), "wait-for-device"], env=env(), timeout=30)
+    adb(meta, "shell", "for p in $(pidof android.hardware.audio.service android.hardware.audio.service.ranchu); "
+        "do kill $p; done", check=False)
+    if not was_root:
+        adb(meta, "unroot", check=False)
+
+
+def cmd_audio_watch(a: argparse.Namespace) -> None:
+    meta = load_meta(a.name)
+    engine = meta.get("pid")
+    hits: list[float] = []
+    heals: list[float] = []
+    log = lambda msg: print(time.strftime("%m-%d %H:%M:%S"), msg, flush=True)  # noqa: E731
+    while engine and pid_alive(engine):
+        try:
+            subprocess.run([str(ADB), "-s", serial(meta), "wait-for-device"], env=env(), timeout=60)
+        except subprocess.TimeoutExpired:
+            continue
+        cat = subprocess.Popen([str(ADB), "-s", serial(meta), "logcat", "-T", "1", "-v", "brief",
+                                f"{AUDIO_HAL_TAG}:W", "*:S"], stdout=subprocess.PIPE, text=True, env=env())
+        for line in cat.stdout:  # type: ignore[union-attr]
+            if "pcm_writei failed" not in line:
+                continue
+            now = time.time()
+            hits = [t for t in hits if now - t < 3] + [now]
+            # One write error can be a glitch; a burst means the stream is stuck.
+            if len(hits) < 5 or (heals and now - heals[-1] < 20):
+                continue
+            heals = [t for t in heals if now - t < 600] + [now]
+            if len(heals) > 3:
+                log("audio still failing after 3 restarts in 10 min; leaving it alone")
+                continue
+            log("audio output stuck (pcm_writei I/O error); restarting the guest audio HAL")
+            cat.terminate()
+            try:
+                heal_audio(meta)
+            except (SystemExit, subprocess.SubprocessError) as e:
+                log(f"restart failed: {e}")
+            hits.clear()
+            break
+        cat.wait()
+        time.sleep(2)
+
+
+# --- First-run setup -------------------------------------------------------------
+# The Android parts come from Google (Android SDK licenses), pinned to the versions
+# Kolibri is tested with, checked by SHA-1, and unpacked into the SDK.
+REPO_URL = "https://dl.google.com/android/repository/"
+SDK_PACKAGES = [
+    {"id": "platform-tools", "title": "Android platform tools (adb)",
+     "url": REPO_URL + "platform-tools_r37.0.1-darwin.zip",
+     "sha1": "6ae73f4de6452dc57e62ec02b68eed92a4c21661", "size": 16110554,
+     "license": "android-sdk-license", "check": "platform-tools/adb", "root": "platform-tools", "into": ""},
+    {"id": "emulator", "title": "Android Emulator engine 36.6.11",
+     "url": REPO_URL + "emulator-darwin_aarch64-15507667.zip",
+     "sha1": "45328141bb585e096a5bebf870ff351e140bcda3", "size": 383903546,
+     "license": "android-sdk-license", "check": "emulator/emulator", "root": "emulator", "into": ""},
+    {"id": "system-image", "title": "Android 16 system image (Google APIs, ARM64)",
+     "url": REPO_URL + "sys-img/google_apis/arm64-v8a-36_r07.zip",
+     "sha1": "5a99183b6d924da606260e45fd41a3eb8eca6eb7", "size": 1872691175,
+     "license": "android-sdk-arm-dbt-license", "check": "system-images/android-36/google_apis/arm64-v8a/system.img",
+     "root": "arm64-v8a", "into": "system-images/android-36/google_apis"},
+]
+LICENSE_SOURCES = [REPO_URL + "repository2-3.xml", REPO_URL + "sys-img/google_apis/sys-img2-3.xml"]
+
+
+def missing_packages() -> list[dict]:
+    return [p for p in SDK_PACKAGES if not (SDK / p["check"]).exists()]
+
+
+def fetch_licenses(ids: set[str]) -> dict:
+    import re
+    import urllib.request
+    out = {}
+    for url in LICENSE_SOURCES:
+        try:
+            xml = urllib.request.urlopen(url, timeout=30).read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for lid in ids - out.keys():
+            m = re.search(rf'<license id="{re.escape(lid)}"[^>]*>(.*?)</license>', xml, re.S)
+            if m:
+                out[lid] = m.group(1).strip()
+    return out
+
+
+def cmd_setup(a: argparse.Namespace) -> None:
+    """kolibrictl setup [--check] [--json] [--accept-licenses] — download the Android
+    engine, system image and adb from Google into the SDK (first launch)."""
+    missing = missing_packages()
+    if a.check:
+        info = {"ready": not missing, "sdk": str(SDK), "missing": [p["title"] for p in missing],
+                "bytes": sum(p["size"] for p in missing)}
+        if missing and a.json:
+            info["licenses"] = fetch_licenses({p["license"] for p in missing})
+        print(json.dumps(info, ensure_ascii=False) if a.json else
+              ("ready" if not missing else "missing: " + ", ".join(info["missing"])))
+        return
+    if not missing:
+        print(json.dumps({"done": True}) if a.json else "everything is installed")
+        return
+    if not a.accept_licenses:
+        die("downloading needs --accept-licenses (Android SDK License Agreement)")
+    import hashlib
+    import urllib.request
+    SDK.mkdir(parents=True, exist_ok=True)
+    tmp_dir = KOLIBRI_HOME / "cache" / "sdk-download"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    total = sum(p["size"] for p in missing)
+    done_before = 0
+    for p in missing:
+        zip_path = tmp_dir / p["url"].rsplit("/", 1)[1]
+        h = hashlib.sha1()
+        got = 0
+        last = 0.0
+        with urllib.request.urlopen(p["url"], timeout=60) as r, zip_path.open("wb") as f:
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+                h.update(chunk)
+                got += len(chunk)
+                if time.time() - last > 0.3:
+                    last = time.time()
+                    print(json.dumps({"package": p["title"], "done": done_before + got, "total": total}), flush=True)
+        if h.hexdigest() != p["sha1"]:
+            zip_path.unlink(missing_ok=True)
+            die(f"{p['title']}: download is corrupt (SHA-1 mismatch), try again")
+        print(json.dumps({"package": p["title"], "done": done_before + got, "total": total, "unpacking": True}), flush=True)
+        unpack = tmp_dir / ("unpack-" + p["id"])
+        shutil.rmtree(unpack, ignore_errors=True)
+        subprocess.run(["ditto", "-x", "-k", str(zip_path), str(unpack)], check=True)
+        dest_parent = SDK / p["into"] if p["into"] else SDK
+        dest_parent.mkdir(parents=True, exist_ok=True)
+        dest = dest_parent / p["root"]
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.move(str(unpack / p["root"]), str(dest))
+        shutil.rmtree(unpack, ignore_errors=True)
+        zip_path.unlink(missing_ok=True)
+        done_before += p["size"]
+    (KOLIBRI_HOME / "licenses-accepted").write_text(
+        "\n".join(sorted({p["license"] for p in SDK_PACKAGES})) + "\n")
+    print(json.dumps({"done": True}) if a.json else f"installed into {SDK}", flush=True)
+
+
+def cmd_stop(a: argparse.Namespace) -> None:
+    meta = load_meta(a.name)
+    pid = running_pid(meta)
+    if not pid:
+        print(f"{a.name} not running")
+        return
+    # Thumbnail for the device list (the last screen), best effort; the
+    # resize runs in the background.
+    thumb = avd_dir(a.name) / "thumbnail.png"
+    try:
+        png = subprocess.run([str(ADB), "-s", serial(meta), "exec-out", "screencap", "-p"],
+                             capture_output=True, timeout=2.5, env=env()).stdout
+        if png.startswith(b"\x89PNG"):
+            thumb.write_bytes(png)
+            subprocess.Popen(["sips", "-Z", "480", str(thumb)], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except subprocess.TimeoutExpired:
+        pass
+    # Graceful: emulator saves the quickboot snapshot on kill via console.
+    adb(meta, "emu", "kill", check=False)
+    if getattr(a, "no_wait", False):
+        # The UI is free right away; `finish-stop` clears the instance once the save is done
+        # (`list` reports it as stopping meanwhile, `start` waits for it).
+        stopping_marker(a.name).write_text(str(pid))
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "finish-stop", a.name],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        print(f"stopping {a.name} (saving in the background)")
+        return
+    finish_stop(a.name, pid)
+    print(f"stopped {a.name}")
+
+
+def stopping_marker(name: str) -> Path:
+    return avd_dir(name) / "stopping"
+
+
+def finish_stop(name: str, pid: int) -> None:
+    for _ in range(int(130 / 0.1)):
+        if not pid_alive(pid):
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):   # exited just now
+            pass
+    (avd_dir(name) / "frame-iosurface.bin").unlink(missing_ok=True)   # zero-copy header
+    meta = load_meta(name)
+    if meta.get("pid") == pid:
+        meta.pop("pid", None)
+        save_meta(name, meta)
+    stopping_marker(name).unlink(missing_ok=True)
+
+
+def cmd_finish_stop(a: argparse.Namespace) -> None:
+    try:
+        pid = int(stopping_marker(a.name).read_text())
+    except (OSError, ValueError):
+        return
+    finish_stop(a.name, pid)
+
+
+def wait_stopping(name: str) -> bool:
+    """A background stop is still saving: wait for it. True if there was one."""
+    marker = stopping_marker(name)
+    if not marker.exists():
+        return False
+    try:
+        pid = int(marker.read_text())
+    except ValueError:
+        pid = 0
+    print(f"{name}: waiting for the previous stop to finish saving")
+    finish_stop(name, pid) if pid else marker.unlink(missing_ok=True)
+    return True
+
+
+def cmd_list(a: argparse.Namespace) -> None:
+    names = instances()
+    if a.json:
+        out = []
+        for n in names:
+            m = load_meta(n)
+            c, ap, g = ports(m)
+            stopping = stopping_marker(n).exists() and bool(running_pid(m))
+            out.append({**m, "running": bool(running_pid(m)) and not stopping, "stopping": stopping,
+                        "serial": serial(m), "grpc_port": g, "console_port": c})
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    if not names:
+        print("no instances (kolibrictl create <name>)")
+    for n in names:
+        m = load_meta(n)
+        state = f"running pid {m['pid']}" if running_pid(m) else "stopped"
+        w, h = m["resolution"]
+        print(f"{n:16} {state:20} {serial(m):16} grpc {ports(m)[2]}  {w}x{h}@{m['refresh_hz']}  {m['profile']}")
+
+
+def cmd_delete(a: argparse.Namespace) -> None:
+    meta = load_meta(a.name)
+    if running_pid(meta):
+        die(f"{a.name} is running; stop it first")
+    d = avd_dir(a.name)
+    shutil.rmtree(d.resolve())
+    if d.is_symlink():
+        d.unlink()  # moved to another folder (`kolibrictl move`)
+    (AVD_HOME / f"{a.name}.ini").unlink(missing_ok=True)
+    print(f"deleted {a.name}")
+
+
+def cmd_adb(a: argparse.Namespace) -> None:
+    meta = load_meta(a.name)
+    os.execve(str(ADB), [str(ADB), "-s", serial(meta), *a.args], env())
+
+
+def cmd_snapshot(a: argparse.Namespace) -> None:
+    meta = load_meta(a.name)
+    if not running_pid(meta):
+        die(f"{a.name} not running")
+    print(adb(meta, "emu", "avd", "snapshot", a.action, a.snapshot, check=False))
+
+
+def cmd_set(a: argparse.Namespace) -> None:
+    """kolibrictl set <name> key=value ...  (gpu=host|angle, guest_angle=true|false, ...)"""
+    meta = load_meta(a.name)
+    for kv in a.pairs:
+        k, v = kv.split("=", 1)
+        meta[k] = {"true": True, "false": False}.get(v.lower(), int(v) if v.isdigit() else v)
+    save_meta(a.name, meta)
+    print(json.dumps({k: meta[k] for k in (kv.split("=")[0] for kv in a.pairs)}, ensure_ascii=False))
+
+
+def cmd_info(a: argparse.Namespace) -> None:
+    meta = load_meta(a.name)
+    c, ap, g = ports(meta)
+    live = {}
+    if running_pid(meta):
+        live = {"android_id": adb(meta, "shell", "settings", "get", "secure", "android_id", check=False),
+                "live_device_name": adb(meta, "shell", "settings", "get", "global", "device_name", check=False)}
+    print(json.dumps({**meta, **live, "serial": serial(meta), "grpc_port": g, "console_port": c,
+                      "running": bool(running_pid(meta)), "dir": str(avd_dir(a.name))}, indent=2, ensure_ascii=False))
+
+
+PROFILES_DIR = ENGINE_DIR / "profiles"
+REPO = ENGINE_DIR.parent
+PROP_BEGIN = "# >>> kolibri device profile"
+PROP_END = "# <<< kolibri device profile"
+
+
+def device_profile(meta: dict) -> dict:
+    """The phone this instance presents: a preset (engine/profiles/*.json) or the
+    user's own (profile "custom", fields in meta["custom_profile"])."""
+    name = meta.get("profile", "stock")
+    if name == "custom":
+        return {**load_profile("flagship-120"), "title": "自定义机型", **meta.get("custom_profile", {})}
+    f = PROFILES_DIR / f"{name}.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
+def load_profile(name: str) -> dict:
+    f = PROFILES_DIR / f"{name}.json"
+    if not f.exists():
+        die(f"unknown profile {name} (have: {', '.join(sorted(p.stem for p in PROFILES_DIR.glob('*.json')))})")
+    return json.loads(f.read_text())
+
+
+def profile_props(p: dict, build_id: str, incremental: str, release: str = "12") -> list[str]:
+    """ro.* overrides appended to /product/etc/build.prop.
+
+    init loads partitions in order system -> system_ext -> vendor -> odm -> product
+    and later files override earlier ones before properties are committed, so a
+    block at the end of the product build.prop wins without touching any other
+    partition. ro.product.model etc. derive from the per-partition values.
+    """
+    fp = f"{p['brand']}/{p['product']}/{p['device']}:{release}/{build_id}/{incremental}:user/release-keys"
+    lines = []
+    for part in ("", "product.", "system.", "system_ext.", "vendor.", "odm.", "bootimage."):
+        for key in ("brand", "manufacturer", "model", "device", "name"):
+            val = p["product"] if key == "name" else p[key]
+            lines.append(f"ro.product.{part}{key}={val}")
+        lines.append(f"ro.{part.replace('bootimage.', 'bootimage.') if part else ''}build.fingerprint={fp}")
+    lines += [
+        f"ro.product.board={p['board']}",
+        f"ro.board.platform={p['platform']}",
+        f"ro.build.product={p['device']}",
+        f"ro.build.tags=release-keys",
+        f"ro.build.type=user",
+        f"ro.build.flavor={p['product']}-user",
+        # Build.SOC_MANUFACTURER / SOC_MODEL: games tier on these next to the GPU name, so
+        # they must name the same chip as the model and $KOLIBRI_GPU_RENDERER (not "ranchu").
+        f"ro.soc.manufacturer={p.get('soc_manufacturer', 'QTI' if p.get('hardware') == 'qcom' else 'Google')}",
+    ]
+    if p.get("soc_model"):
+        lines.append(f"ro.soc.model={p['soc_model']}")
+    return [PROP_BEGIN, *lines, PROP_END]
+
+
+def adb_retry(meta: dict, *args: str, tries: int = 20) -> str:
+    for _ in range(tries):
+        r = subprocess.run([str(ADB), "-s", serial(meta), *args], capture_output=True, text=True, env=env())
+        if r.returncode == 0:
+            return (r.stdout + r.stderr).strip()
+        time.sleep(1)
+    die(f"adb {' '.join(args)} kept failing: {r.stderr.strip()}")
+
+
+def reboot_and_wait(meta: dict, timeout: float = 240) -> None:
+    """Reboot as a cold restart of the whole engine. An in-guest `adb reboot` keeps the
+    host's Vulkan objects from before the reboot; with GuestAngle the rebooted guest then
+    hits stale handles and the engine aborts (FATAL "Failed to unbox VkImage")."""
+    t0 = time.time()
+    adb(meta, "shell", "sync", check=False)
+    cmd_stop(argparse.Namespace(name=meta["name"]))
+    cmd_start(argparse.Namespace(name=meta["name"], window=False, cold=True,
+                                 writable_system=bool(meta.get("writable_system")), no_wait=False, timeout=timeout))
+    meta.update(load_meta(meta["name"]))   # new pid
+    print(f"  rebooted ({time.time() - t0:.0f}s)")
+
+
+def ensure_root_remount(meta: dict) -> None:
+    adb_retry(meta, "root")
+    subprocess.run([str(ADB), "-s", serial(meta), "wait-for-device"], env=env(), timeout=60)
+    wait_boot(meta, 120)
+    out = adb_retry(meta, "remount")
+    if "reboot" in out.lower():
+        print("  remount needs a reboot (first-time overlay setup)")
+        reboot_and_wait(meta)
+        adb_retry(meta, "root")
+        subprocess.run([str(ADB), "-s", serial(meta), "wait-for-device"], env=env(), timeout=60)
+        wait_boot(meta, 120)
+        out = adb_retry(meta, "remount")
+    print(f"  remount: {out.splitlines()[-1] if out else 'ok'}")
+
+
+
+INIT_RC = """# Kolibri guest tuning (installed by kolibrictl provision)
+on early-boot
+    # UI renders with GL so the engine can snapshot (Vulkan UI blocks quickboot);
+    # games still get Vulkan.
+    setprop debug.hwui.renderer skiagl
+
+# zram ships as a kernel module and init's own domain may not load modules,
+# so a oneshot helper in the su domain (userdebug image) sets it up.
+service kolibri_zram /system/bin/sh /system/etc/kolibri-zram.sh
+    user root
+    group root
+    seclabel u:r:su:s0
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    start kolibri_zram
+"""
+
+ZRAM_SH = """#!/system/bin/sh
+# 1) zram (fast, compressed in RAM)  2) disk swap file (cold pages go to
+# the Mac's SSD via the userdata qcow2 instead of staying in physical memory).
+if ! grep -q zram0 /proc/swaps; then
+  for d in /system_dlkm/lib/modules /vendor/lib/modules /vendor_dlkm/lib/modules /lib/modules; do
+    [ -f $d/zsmalloc.ko ] && insmod $d/zsmalloc.ko 2>/dev/null
+    [ -f $d/zram.ko ] && insmod $d/zram.ko 2>/dev/null
+  done
+  if [ -e /sys/block/zram0 ]; then
+    echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null
+    echo $(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 2 ))K > /sys/block/zram0/disksize
+    mkswap /dev/block/zram0 >/dev/null && swapon -p 10 /dev/block/zram0
+  fi
+fi
+SWAPFILE=/data/kolibri.swap
+if ! grep -q kolibri.swap /proc/swaps; then
+  [ -f $SWAPFILE ] || { dd if=/dev/zero of=$SWAPFILE bs=1048576 count=2048 2>/dev/null && chmod 600 $SWAPFILE && mkswap $SWAPFILE >/dev/null; }
+  swapon -p 1 $SWAPFILE 2>/dev/null
+fi
+echo 100 > /proc/sys/vm/swappiness
+"""
+
+
+# Google Play services core: kept on "overseas" instances (gms=true), removed on CN-clean ones.
+GMS_CORE = ["com.google.android.gms", "com.google.android.gsf", "com.android.vending"]
+SU_PATH, SU_HIDDEN = "/system/xbin/su", "/system/xbin/.su.kolibri"
+
+
+def slim_guest(meta: dict) -> None:
+    pkgs = [l.strip() for l in (ENGINE_DIR / "slim/remove.txt").read_text().splitlines()
+            if l.strip() and not l.startswith("#")]
+    if meta.get("gms"):
+        pkgs = [p for p in pkgs if p not in GMS_CORE]
+    installed = {l.removeprefix("package:").strip() for l in adb(meta, "shell", "pm", "list", "packages").splitlines()}
+    removed = 0
+    for pkg in pkgs:
+        if pkg in installed:
+            r = adb(meta, "shell", "pm", "uninstall", "-k", "--user", "0", pkg, check=False)
+            removed += "Success" in r
+    print(f"  slim: removed {removed} packages")
+    # Fewer cached background processes, Bluetooth off.
+    adb(meta, "shell", "device_config", "put", "activity_manager", "max_cached_processes", "6")
+    adb(meta, "shell", "device_config", "set_sync_disabled_for_tests", "persistent")
+    adb(meta, "shell", "settings", "put", "global", "bluetooth_on", "0")
+    adb(meta, "shell", "cmd", "bluetooth_manager", "disable", check=False)
+    # PackageManager persists packages.xml on a ~10s delayed write; rebooting before
+    # it flushes silently brings every uninstalled package back.
+    time.sleep(12)
+    adb(meta, "shell", "sync")
+    adb(meta, "shell", f"cat > /system/etc/init/kolibri.rc <<'RC'\n{INIT_RC}RC")
+    adb(meta, "shell", "chmod 644 /system/etc/init/kolibri.rc")
+    adb(meta, "shell", f"cat > /system/etc/kolibri-zram.sh <<'SH'\n{ZRAM_SH}SH")
+    adb(meta, "shell", "chmod 755 /system/etc/kolibri-zram.sh")
+
+
+# Apps that keep a launcher icon; everything else with one is removed for user 0.
+KEEP_APPS = {"com.android.settings", "com.android.chrome", "com.android.documentsui",
+             "com.google.android.documentsui", "dev.kolibri.launcher"}
+FILES_LAUNCHER = "com.android.documentsui.LauncherActivity"
+
+
+def keep_only_core_apps(meta: dict) -> None:
+    out = adb(meta, "shell", "cmd", "package", "query-activities", "--brief",
+              "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", check=False)
+    # Only preinstalled apps: games the user installed themselves are never touched.
+    system = {l.removeprefix("package:").strip() for l in adb(meta, "shell", "pm", "list", "packages", "-s").splitlines()}
+    pkgs = sorted({l.strip().split("/")[0] for l in out.splitlines() if "/" in l} & system)
+    keep = KEEP_APPS | ({"com.android.vending"} if meta.get("gms") else set())
+    removed = [p for p in pkgs if p not in keep
+               and "Success" in adb(meta, "shell", "pm", "uninstall", "-k", "--user", "0", p, check=False)]
+    # DocumentsUI ships its "Files" icon disabled on phone images.
+    for pkg in ("com.google.android.documentsui", "com.android.documentsui"):
+        adb(meta, "shell", "pm", "enable", f"{pkg}/{FILES_LAUNCHER}", check=False)
+    # Browser opens straight to a page: no first-run, sign-in or default-browser prompts.
+    flags = "_ --disable-fre --no-default-browser-check --no-first-run --disable-signin-promo"
+    adb(meta, "shell", f"echo '{flags}' > /data/local/tmp/chrome-command-line; chmod 644 /data/local/tmp/chrome-command-line")
+    adb(meta, "shell", "am", "set-debug-app", "--persistent", "com.android.chrome", check=False)
+    adb(meta, "shell", "pm", "grant", "com.android.chrome", "android.permission.POST_NOTIFICATIONS", check=False)
+    # No connectivity probe to Google (unreachable in CN: Wi-Fi shows "?" and apps think
+    # they are offline). The emulated network is always online anyway.
+    adb(meta, "shell", "settings", "put", "global", "captive_portal_mode", "0")
+    # The emulated Wi-Fi network is normally saved by googlesdksetup, which the slim list
+    # removes; without it the guest sits on emulated 5G and games warn about mobile data.
+    adb(meta, "shell", "cmd", "wifi", "connect-network", "AndroidWifi", "open", check=False)
+    adb(meta, "shell", "am", "force-stop", "com.android.chrome", check=False)
+    time.sleep(12)          # let PackageManager flush packages.xml (see slim_guest)
+    adb(meta, "shell", "sync")
+    left = adb(meta, "shell", "cmd", "package", "query-activities", "--brief",
+               "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", check=False)
+    icons = sorted({l.strip().split("/")[0] for l in left.splitlines() if "/" in l})
+    print(f"  apps: removed {len(removed)} ({', '.join(removed) or '-'}); icons now: {', '.join(icons)}")
+
+
+def apply_gms(meta: dict, on: bool) -> str:
+    """Google services on (overseas games: login, purchases) or off (CN-clean)."""
+    for pkg in GMS_CORE:
+        if on:
+            adb(meta, "shell", "cmd", "package", "install-existing", "--user", "0", pkg, check=False)
+            adb(meta, "shell", "pm", "enable", pkg, check=False)
+        else:
+            adb(meta, "shell", "pm", "uninstall", "-k", "--user", "0", pkg, check=False)
+    time.sleep(12)          # PackageManager writes packages.xml late (see slim_guest)
+    adb(meta, "shell", "sync")
+    present = {l.removeprefix("package:").strip() for l in adb(meta, "shell", "pm", "list", "packages").splitlines()}
+    return ", ".join(f"{p.rsplit('.', 1)[-1]}={'on' if p in present else 'off'}" for p in GMS_CORE)
+
+
+def apply_root(meta: dict, on: bool) -> str:
+    """Root for apps (su). Off hides the su binary; kolibrictl itself uses adbd root, not su."""
+    ensure_root_remount(meta)
+    if on:
+        adb(meta, "shell", f"[ -e {SU_HIDDEN} ] && mv {SU_HIDDEN} {SU_PATH}; true")
+    else:
+        adb(meta, "shell", f"[ -e {SU_PATH} ] && mv {SU_PATH} {SU_HIDDEN}; true")
+    adb(meta, "shell", "sync")
+    return "su present" if adb(meta, "shell", f"[ -e {SU_PATH} ] && echo yes", check=False) == "yes" else "su hidden"
+
+
+# Aurora Store: open-source (GPL) Google Play client, ~9 MB. Every device gets it so games
+# can be downloaded without a Play Store app. F-Droid build, pinned by hash.
+STORE_URL = "https://f-droid.org/repo/com.aurora.store_76.apk"
+STORE_SHA256 = "fd9c75d90d0f4a7c132b9b4a5a2cf1992a45e03b8d8ff988b7dcfbc0db2c4d11"
+STORE_PKG = "com.aurora.store"
+
+
+def store_apk() -> Path:
+    """Download (once) and verify the Aurora Store APK."""
+    import hashlib
+    import urllib.request
+    apk = KOLIBRI_HOME / "cache" / STORE_URL.rsplit("/", 1)[1]
+    if not apk.exists() or hashlib.sha256(apk.read_bytes()).hexdigest() != STORE_SHA256:
+        apk.parent.mkdir(parents=True, exist_ok=True)
+        tmp = apk.with_suffix(".part")
+        urllib.request.urlretrieve(STORE_URL, tmp)
+        if hashlib.sha256(tmp.read_bytes()).hexdigest() != STORE_SHA256:
+            tmp.unlink(missing_ok=True)
+            die(f"Aurora Store download does not match its pinned hash ({STORE_URL})")
+        tmp.rename(apk)
+    return apk
+
+
+def install_store(meta: dict) -> str:
+    if adb(meta, "shell", "pm", "path", STORE_PKG, check=False):
+        return "already installed"
+    out = adb(meta, "install", "-r", "-g", str(store_apk()), check=False)
+    return "installed" if "Success" in out else f"failed: {out}"
+
+
+def cmd_store(a: argparse.Namespace) -> None:
+    """kolibrictl store <name> — install Aurora Store on a running device."""
+    meta = load_meta(a.name)
+    if not running_pid(meta):
+        die(f"{a.name} not running (start it first)")
+    wait_boot(meta, 120)
+    print(f"{a.name}: Aurora Store {install_store(meta)}")
+
+
+WALLPAPER = ENGINE_DIR.parent / "guest/wallpaper/kolibri-wallpaper-2560x1440.png"
+DEVICE_WALLPAPER = "/product/media/kolibri_wallpaper.png"
+
+
+def clear_wallpaper(meta: dict) -> None:
+    """Forget the current wallpaper so the default (ro.config.wallpaper) shows after the
+    next boot. Only for fresh devices or on request: it drops a wallpaper the user chose."""
+    adb(meta, "shell", "rm -f /data/system/users/0/wallpaper /data/system/users/0/wallpaper_orig "
+        "/data/system/users/0/wallpaper_lock /data/system/users/0/wallpaper_lock_orig "
+        "/data/system/users/0/wallpaper_info.xml; sync", check=False)
+
+
+def cmd_wallpaper(a: argparse.Namespace) -> None:
+    """kolibrictl wallpaper <name> — switch a running instance to the Kolibri wallpaper."""
+    meta = load_meta(a.name)
+    if not running_pid(meta):
+        die(f"{a.name} not running (start it first)")
+    adb_retry(meta, "root")
+    wait_boot(meta, 60)
+    ensure_root_remount(meta)
+    write_identity(meta, device_profile(meta))
+    clear_wallpaper(meta)
+    reboot_and_wait(meta)
+    settle(meta)
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "default_boot", check=False) or "saved")
+
+
+def write_identity(meta: dict, prof: dict) -> None:
+    """Device identity and frame-rate props at the end of /product/etc/build.prop
+    (needs root + remount; applied on the next boot)."""
+    build_id = adb(meta, "shell", "getprop", "ro.build.id")
+    incremental = adb(meta, "shell", "getprop", "ro.build.version.incremental")
+    target = "/product/etc/build.prop"
+    adb(meta, "shell", f"sed -i '/^{PROP_BEGIN}/,/^{PROP_END}/d' {target}")
+    # No on-screen nav bar: Back/Home/Recents live in the frontend toolbar.
+    adb(meta, "shell", f"sed -i '/^qemu.hw.mainkeys=/d' {target}")
+    adb(meta, "shell", f"echo qemu.hw.mainkeys=1 >> {target}")
+    # Android 14+ caps every app in the "game" category at 60 fps by default
+    # (SurfaceFlinger game frame-rate override). A game emulator must not.
+    adb(meta, "shell", f"sed -i '/^ro.surface_flinger.game_default_frame_rate_override=/d' {target}")
+    adb(meta, "shell", f"echo ro.surface_flinger.game_default_frame_rate_override=0 >> {target}")
+    # Kolibri wallpaper as the system default (shown until the user picks another one,
+    # and what "reset wallpaper" returns to). WallpaperManager reads ro.config.wallpaper.
+    if WALLPAPER.exists():
+        adb(meta, "shell", "mkdir -p /product/media")
+        adb(meta, "push", str(WALLPAPER), DEVICE_WALLPAPER)
+        adb(meta, "shell", f"chmod 644 {DEVICE_WALLPAPER}")
+        adb(meta, "shell", f"sed -i '/^ro.config.wallpaper=/d' {target}")
+        adb(meta, "shell", f"echo ro.config.wallpaper={DEVICE_WALLPAPER} >> {target}")
+    if not prof.get("stock"):
+        release = adb(meta, "shell", "getprop", "ro.build.version.release")
+        block = "\n".join(profile_props(prof, build_id, incremental, release))
+        adb(meta, "shell", f"printf '%b\\n' '{block}' >> {target}")
+
+
+def cmd_reprofile(a: argparse.Namespace) -> None:
+    """kolibrictl reprofile <name> [--profile P] — re-apply a device profile to a running
+    instance without re-provisioning, then re-save its boot snapshot."""
+    meta = load_meta(a.name)
+    if not running_pid(meta):
+        die(f"{a.name} not running (start it first)")
+    name = a.profile or meta.get("profile", "stock")
+    prof = device_profile({**meta, "profile": name})
+    adb_retry(meta, "root")
+    wait_boot(meta, 60)
+    ensure_root_remount(meta)
+    write_identity(meta, prof)
+    reboot_and_wait(meta)
+    meta = load_meta(a.name)
+    meta["profile"] = name
+    save_meta(a.name, meta)
+    settle(meta)
+    print(f"{a.name}: profile {name} ({prof.get('title', '')})  model={adb(meta, 'shell', 'getprop', 'ro.product.model')}"
+          f"  soc={adb(meta, 'shell', 'getprop', 'ro.soc.model')}")
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "default_boot", check=False) or "saved")
+
+
+def _ns(name: str, **kw) -> argparse.Namespace:
+    d = dict(name=name, window=False, cold=False, writable_system=False, no_wait=False, timeout=300)
+    d.update(kw)
+    return argparse.Namespace(**d)
+
+
+# Settings the engine reads at boot (config.ini, command line, env): a cold restart applies them.
+EDIT_BOOT_KEYS = {"cores", "ram_mb", "resolution", "dpi", "refresh_hz", "phone_number", "gpu_renderer"}
+# Phone identity written into /product/etc/build.prop: needs a remount and a reboot.
+EDIT_ID_KEYS = {"profile", "custom_profile"}
+EDIT_LIVE_KEYS = {"device_name", "root"}
+
+
+def cmd_edit(a: argparse.Namespace) -> None:
+    """kolibrictl edit <name> --json '{"cores":6,"resolution":[1920,1080],...}' — change a
+    device's performance, display, phone model/GPU and identity, then re-save its snapshot.
+    A stopped device is started for the change and stopped again afterwards."""
+    meta = load_meta(a.name)
+    want = json.loads(a.json)
+    unknown = set(want) - EDIT_BOOT_KEYS - EDIT_ID_KEYS - EDIT_LIVE_KEYS
+    if unknown:
+        die(f"cannot edit: {', '.join(sorted(unknown))}")
+    changes = {k: v for k, v in want.items() if meta.get(k) != v}
+    if not changes:
+        print(f"{a.name}: nothing to change")
+        return
+    if "resolution" in changes:
+        w, h = (int(x) for x in changes["resolution"])
+        if not (320 <= w <= 3840 and 320 <= h <= 3840):
+            die("resolution out of range (320-3840)")
+        changes["resolution"] = [w, h]
+    if changes.get("profile", meta.get("profile")) == "custom" and not {**meta, **changes}.get("custom_profile"):
+        die("profile custom needs custom_profile fields")
+    was_running = bool(running_pid(meta))
+    meta.update(changes)
+    save_meta(a.name, meta)
+    print(f"{a.name}: " + ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in changes.items()))
+
+    if EDIT_BOOT_KEYS & changes.keys():
+        if was_running:
+            cmd_stop(_ns(a.name))
+        meta = load_meta(a.name)
+        (avd_dir(a.name) / "config.ini").write_text(render_config(meta))
+        cmd_start(_ns(a.name, cold=True, writable_system=bool(meta.get("writable_system"))))
+    elif not was_running:
+        cmd_start(_ns(a.name, writable_system=bool(meta.get("writable_system"))))
+    meta = load_meta(a.name)
+    adb_retry(meta, "root")
+    wait_boot(meta, 120)
+    if EDIT_ID_KEYS & changes.keys():
+        ensure_root_remount(meta)
+        write_identity(meta, device_profile(meta))
+        reboot_and_wait(meta)
+        adb_retry(meta, "root")
+        wait_boot(meta, 120)
+    if "root" in changes:
+        print("  root:", apply_root(meta, bool(changes["root"])))
+    if "refresh_hz" in changes:
+        hz = f"{float(meta['refresh_hz']):.1f}"
+        for key in ("peak_refresh_rate", "min_refresh_rate"):
+            adb(meta, "shell", "settings", "put", "system", key, hz)
+    if "device_name" in changes:
+        if meta["device_name"]:
+            adb(meta, "shell", "settings", "put", "global", "device_name", f"'{meta['device_name']}'")
+        else:
+            adb(meta, "shell", "settings", "delete", "global", "device_name", check=False)
+    settle(meta)
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "default_boot", check=False) or "saved")
+    if not was_running:
+        cmd_stop(_ns(a.name))
+
+
+def cmd_clone(a: argparse.Namespace) -> None:
+    """kolibrictl clone <src> <new> — copy a stopped device (APFS clone: instant, and it
+    shares disk blocks until the two diverge). The copy gets its own ports and cold-boots."""
+    src = load_meta(a.src)
+    if running_pid(src):
+        die(f"{a.src} is running; stop it before copying")
+    if not a.dst.replace("-", "").replace("_", "").isalnum():
+        die("name: letters, digits, - and _ only")
+    if avd_dir(a.dst).exists() or (AVD_HOME / f"{a.dst}.ini").exists():
+        die(f"instance exists: {a.dst}")
+    src_dir = str(avd_dir(a.src).resolve())
+    # APFS clone when both sit on the same volume; a plain copy from another drive.
+    if subprocess.run(["cp", "-cR", src_dir, str(avd_dir(a.dst))]).returncode != 0:
+        shutil.rmtree(avd_dir(a.dst), ignore_errors=True)
+        subprocess.run(["cp", "-R", src_dir, str(avd_dir(a.dst))], check=True)
+    d = avd_dir(a.dst)
+    # Snapshots and runtime files belong to the source engine; the copy starts cold.
+    shutil.rmtree(d / "snapshots", ignore_errors=True)
+    for pattern in ("*.lock", "engine.log", "frame-*.rgba", "hardware-qemu.ini", "read-snapshot.txt"):
+        for f in d.glob(pattern):
+            if f.is_dir():
+                shutil.rmtree(f, ignore_errors=True)
+            else:
+                f.unlink(missing_ok=True)
+    meta = {**src, "name": a.dst, "slot": alloc_slot(), "created": int(time.time())}
+    meta.pop("pid", None)
+    save_meta(a.dst, meta)
+    (d / "config.ini").write_text(render_config(meta))
+    write_avd_ini(a.dst, meta.get("image", DEFAULT_IMAGE))
+    print(f"cloned {a.src} -> {a.dst} (slot {meta['slot']})")
+
+
+# --- Storage -------------------------------------------------------------------
+# Each device keeps its disks in its own folder: by default ~/.kolibri/avd/<name>.avd;
+# `move` puts it anywhere (e.g. an external drive) and leaves a symlink behind, so the
+# engine and every other command keep using the usual path.
+
+def qemu_img(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run([str(SDK / "emulator" / "qemu-img"), *args], capture_output=True, text=True, check=check)
+
+
+def dir_bytes(d: Path) -> int:
+    r = subprocess.run(["du", "-sk", str(d.resolve())], capture_output=True, text=True)
+    return int(r.stdout.split()[0]) * 1024 if r.returncode == 0 and r.stdout else 0
+
+
+def storage_info(name: str) -> dict:
+    meta = load_meta(name)
+    d = avd_dir(name)
+    real = d.resolve()
+    return {
+        "name": name,
+        "dir": str(real),
+        "custom_dir": d.is_symlink(),
+        "on_disk": dir_bytes(d),
+        "data_gb": meta.get("data_gb", 16),
+        "free": shutil.disk_usage(real).free,
+        "running": bool(running_pid(meta)),
+    }
+
+
+def cmd_storage(a: argparse.Namespace) -> None:
+    info = storage_info(a.name)
+    if a.json:
+        print(json.dumps(info, ensure_ascii=False))
+        return
+    print(f"{a.name}: {info['on_disk'] / 2**30:.1f} GB on disk in {info['dir']}, data partition "
+          f"{info['data_gb']} GB, {info['free'] / 2**30:.0f} GB free there")
+
+
+def require_stopped(meta: dict, what: str) -> None:
+    if running_pid(meta):
+        die(f"{meta['name']} is running; stop it before {what}")
+
+
+def cmd_clean(a: argparse.Namespace) -> None:
+    """kolibrictl clean <name> — give back disk space: drop the snapshots (each keeps old
+    copies of every block written since, plus a RAM image) and rewrite the disk images
+    compactly. The next start is a cold boot.
+    (Space Android frees inside /data can't be reclaimed: this engine's virtio-blk has no
+    discard, and /data is metadata-encrypted, so zero-filling doesn't help either.)"""
+    meta = load_meta(a.name)
+    d = avd_dir(a.name).resolve()
+    before = dir_bytes(d)
+    if running_pid(meta):
+        cmd_stop(_ns(a.name))
+    shutil.rmtree(d / "snapshots", ignore_errors=True)
+    for img in sorted(d.glob("*.qcow2")):
+        info = json.loads(qemu_img("info", "--output=json", str(img)).stdout)
+        for sn in info.get("snapshots", []):
+            qemu_img("snapshot", "-d", sn["name"], str(img), check=False)
+        if info.get("actual-size", 0) < 64 << 20:
+            continue
+        tmp = img.with_name(img.name + ".compact")
+        args = ["convert", "-O", "qcow2"]
+        if info.get("backing-filename"):
+            args += ["-B", info["backing-filename"], "-o", f"backing_fmt={info.get('backing-filename-format', 'raw')}"]
+        r = qemu_img(*args, str(img), str(tmp), check=False)
+        if r.returncode != 0 or qemu_img("check", str(tmp), check=False).returncode != 0:
+            tmp.unlink(missing_ok=True)
+            print(f"  {img.name}: kept as is ({(r.stderr or 'check failed').strip()[:200]})")
+            continue
+        os.replace(tmp, img)
+    for f in ("read-snapshot.txt", "snapshot.trace"):
+        (d / f).unlink(missing_ok=True)
+    after = dir_bytes(d)
+    print(f"cleaned {a.name}: {before / 2**30:.1f} GB -> {after / 2**30:.1f} GB "
+          f"(freed {(before - after) / 2**30:.1f} GB)")
+
+
+def cmd_resize(a: argparse.Namespace) -> None:
+    """kolibrictl resize <name> <GB> — grow the data partition (apps, games, downloads)."""
+    meta = load_meta(a.name)
+    require_stopped(meta, "resizing")
+    old = int(meta.get("data_gb", 16))
+    if a.gb < old:
+        die(f"the data partition can only grow (now {old} GB)")
+    if a.gb > 256:
+        die("at most 256 GB")
+    # The engine checks for 1.2x the data size in free space before every start, even
+    # though the image is sparse and only grows with real data.
+    free_gb = shutil.disk_usage(avd_dir(a.name).resolve()).free / 2**30
+    if a.gb * 1.2 > free_gb:
+        die(f"needs {a.gb * 1.2:.0f} GB free on this disk to start afterwards; {free_gb:.0f} GB free")
+    if a.gb == old:
+        print(f"{a.name}: already {old} GB")
+        return
+    img = avd_dir(a.name) / "userdata-qemu.img.qcow2"
+    if img.exists():
+        # Snapshots pin the old disk size; the next start is a cold boot.
+        shutil.rmtree(avd_dir(a.name) / "snapshots", ignore_errors=True)
+        info = json.loads(qemu_img("info", "--output=json", str(img)).stdout)
+        for sn in info.get("snapshots", []):
+            qemu_img("snapshot", "-d", sn["name"], str(img), check=False)
+        qemu_img("resize", str(img), f"{a.gb}G")
+    meta["data_gb"] = a.gb
+    meta["grow_fs"] = True  # the filesystem follows on the next boot (grow_data_fs)
+    save_meta(a.name, meta)
+    (avd_dir(a.name) / "config.ini").write_text(render_config(meta))
+    print(f"{a.name}: data partition {old} GB -> {a.gb} GB")
+
+
+def grow_data_fs(meta: dict) -> None:
+    """Grow /data's ext4 into a bigger disk, online. Android only formats /data to the
+    full disk on a factory reset; a used filesystem grows as far as ext4's online resize
+    allows (about +25% in tests: 8 -> 10 of 12 GB)."""
+    was_root = adb(meta, "shell", "id", "-u", check=False) == "0"
+    if not was_root:
+        adb_retry(meta, "root")
+        subprocess.run([str(ADB), "-s", serial(meta), "wait-for-device"], env=env(), timeout=30)
+    adb(meta, "shell", "resize2fs $(mount | grep ' /data ' | cut -d' ' -f1)", check=False)
+    size = adb(meta, "shell", "df -h /data | tail -1", check=False).split()
+    if not was_root:
+        adb(meta, "unroot", check=False)
+    meta = load_meta(meta["name"])
+    meta.pop("grow_fs", None)
+    save_meta(meta["name"], meta)
+    print(f"  data: {size[1] if len(size) > 1 else '?'} usable")
+
+
+def cmd_move(a: argparse.Namespace) -> None:
+    """kolibrictl move <name> <folder|default> — keep this device's disks in another
+    folder (another drive, say). `default` brings it back to ~/.kolibri/avd."""
+    meta = load_meta(a.name)
+    require_stopped(meta, "moving it")
+    link = avd_dir(a.name)
+    cur = link.resolve()
+    dest = (AVD_HOME if a.dir == "default" else Path(a.dir).expanduser().resolve()) / f"{a.name}.avd"
+    if dest == cur:
+        print(f"{a.name} is already in {cur.parent}")
+        return
+    if dest.exists() and not (dest == link and link.is_symlink()):
+        die(f"{dest} already exists")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    need = dir_bytes(cur)
+    if os.stat(dest.parent).st_dev != os.stat(cur).st_dev and shutil.disk_usage(dest.parent).free < need + (1 << 30):
+        die(f"not enough space in {dest.parent} (needs {need / 2**30:.1f} GB)")
+    if link.is_symlink():
+        link.unlink()
+    try:
+        shutil.move(str(cur), str(dest))  # rename on the same volume, copy + delete across
+    except Exception:
+        if not link.exists():
+            link.symlink_to(cur)
+        raise
+    if dest != link:
+        link.symlink_to(dest)
+    print(f"moved {a.name} -> {dest.parent}")
+
+
+def cmd_rename(a: argparse.Namespace) -> None:
+    """kolibrictl rename <name> <new> — rename a stopped device (its next start is a cold boot:
+    snapshots carry the old paths)."""
+    meta = load_meta(a.name)
+    require_stopped(meta, "renaming it")
+    if not a.new.replace("-", "").replace("_", "").isalnum():
+        die("name: letters, digits, - and _ only")
+    if avd_dir(a.new).exists() or (AVD_HOME / f"{a.new}.ini").exists():
+        die(f"instance exists: {a.new}")
+    old_dir = avd_dir(a.name)
+    if old_dir.is_symlink():   # kept in another folder (`move`): rename there, relink here
+        real = old_dir.resolve()
+        new_real = real.with_name(f"{a.new}.avd")
+        real.rename(new_real)
+        old_dir.unlink()
+        avd_dir(a.new).symlink_to(new_real)
+    else:
+        old_dir.rename(avd_dir(a.new))
+    (AVD_HOME / f"{a.name}.ini").unlink(missing_ok=True)
+    d = avd_dir(a.new)
+    shutil.rmtree(d / "snapshots", ignore_errors=True)
+    for f in ("hardware-qemu.ini", "read-snapshot.txt"):
+        (d / f).unlink(missing_ok=True)
+    meta["name"] = a.new
+    save_meta(a.new, meta)
+    (d / "config.ini").write_text(render_config(meta))
+    write_avd_ini(a.new, meta.get("image", DEFAULT_IMAGE))
+    print(f"renamed {a.name} -> {a.new}")
+
+def cmd_reset(a: argparse.Namespace) -> None:
+    """kolibrictl reset <name> — factory reset: wipe apps and data, then provision again
+    (same phone model, resolution and performance settings)."""
+    meta = load_meta(a.name)
+    if running_pid(meta):
+        cmd_stop(_ns(a.name))
+    shutil.rmtree(avd_dir(a.name) / "snapshots", ignore_errors=True)
+    meta = load_meta(a.name)
+    meta["provisioned"] = False
+    meta.pop("grow_fs", None)  # wipe-data formats /data at the full size
+    save_meta(a.name, meta)
+    cmd_start(_ns(a.name, cold=True, wipe=True, writable_system=True))
+    cmd_provision(argparse.Namespace(name=a.name, profile=None, locale="zh-CN", ram=None, no_slim=False))
+    meta = load_meta(a.name)
+    settle(meta)
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "default_boot", check=False) or "saved")
+
+
+def cmd_reset_id(a: argparse.Namespace) -> None:
+    """kolibrictl reset-id <name> — new Android ID for every app (what games use to tell
+    devices apart; IMEI and MAC are not readable by apps since Android 10 / 6)."""
+    meta = load_meta(a.name)
+    if not running_pid(meta):
+        die(f"{a.name} not running (start it first)")
+    adb_retry(meta, "root")
+    wait_boot(meta, 60)
+    before = adb(meta, "shell", "settings", "get", "secure", "android_id", check=False)
+    adb(meta, "shell", "rm -f /data/system/users/0/settings_ssaid.xml; sync")
+    reboot_and_wait(meta)
+    adb_retry(meta, "root")
+    wait_boot(meta, 120)
+    after = adb(meta, "shell", "settings", "get", "secure", "android_id", check=False)
+    print(f"{a.name}: android_id {before} -> {after}")
+    settle(meta)
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "default_boot", check=False) or "saved")
+
+
+def cmd_toggle(a: argparse.Namespace) -> None:
+    """kolibrictl gms|root <name> on|off — switch a running instance and re-save its snapshot."""
+    meta = load_meta(a.name)
+    if not running_pid(meta):
+        die(f"{a.name} not running (start it first)")
+    on = a.state == "on"
+    key = a.cmd
+    meta[key] = on
+    save_meta(a.name, meta)
+    adb_retry(meta, "root")
+    wait_boot(meta, 60)
+    state = apply_gms(meta, on) if key == "gms" else apply_root(meta, on)
+    print(f"{a.name}: {key} {'on' if on else 'off'} ({state})")
+    if key == "gms":
+        # Google services' first start right after install-existing floods system_server and
+        # SystemUI ANRs; a clean boot avoids that, and the snapshot must not capture it.
+        reboot_and_wait(meta)
+    settle(meta)
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "default_boot", check=False) or "saved")
+
+
+def settle(meta: dict, quiet_s: float = 20, timeout: float = 180) -> None:
+    """Wait until the guest is idle (load below 2 and no app ANR) before a snapshot."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        load = adb(meta, "shell", "cat /proc/loadavg", check=False).split()
+        anr = adb(meta, "shell", "dumpsys activity processes | grep -c notResponding=true", check=False)
+        if load and float(load[0]) < 2.0 and anr.strip() in ("", "0"):
+            time.sleep(quiet_s)
+            return
+        time.sleep(5)
+
+
+def cmd_provision(a: argparse.Namespace) -> None:
+    meta = load_meta(a.name)
+    profile_name = a.profile or meta["profile"]
+    prof = device_profile({**meta, "profile": profile_name})
+    t0 = time.time()
+    print(f"provisioning {a.name} with profile {profile_name} ({prof.get('title', '')})")
+
+    # 1. The per-instance system overlay lives in the AVD dir; the shared base image stays pristine.
+    if running_pid(meta) and not meta.get("writable_system"):
+        cmd_stop(argparse.Namespace(name=a.name))
+        meta = load_meta(a.name)
+    meta["writable_system"] = True
+    if a.ram:
+        meta["ram_mb"] = a.ram
+    save_meta(a.name, meta)
+    if running_pid(meta) and a.ram:
+        cmd_stop(argparse.Namespace(name=a.name))
+        meta = load_meta(a.name)
+    (avd_dir(a.name) / "config.ini").write_text(render_config(meta))
+    if not running_pid(meta):
+        cmd_start(argparse.Namespace(name=a.name, window=False, cold=True, writable_system=True, no_wait=False, timeout=300))
+        meta = load_meta(a.name)
+    ensure_root_remount(meta)
+
+    # 2. Device identity (on by default; the "stock" profile removes it) and wallpaper.
+    write_identity(meta, prof)
+    clear_wallpaper(meta)
+    # 3. Strip the guest (no GMS, no bloat) + zram + GL UI; applied by the reboot below.
+    if not a.no_slim:
+        slim_guest(meta)
+    # Locale (Chinese by default, like the target audience).
+    adb(meta, "shell", "setprop", "persist.sys.locale", a.locale)
+    reboot_and_wait(meta)
+    adb_retry(meta, "root")
+    wait_boot(meta, 120)
+
+    # 4. Unlock the guest frame rate: the panel runs at hw.lcd.vsync, but the
+    #    framework caps rendering at 60 unless these are raised.
+    hz = f"{float(prof.get('refresh_hz', meta['refresh_hz'])):.1f}"
+    for key in ("peak_refresh_rate", "min_refresh_rate"):
+        adb(meta, "shell", "settings", "put", "system", key, hz)
+    # Game-friendly defaults: no screen timeout, stay awake, faster UI animations.
+    adb(meta, "shell", "settings", "put", "system", "screen_off_timeout", "2147483647")
+    adb(meta, "shell", "settings", "put", "global", "stay_on_while_plugged_in", "7")
+    for k in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
+        adb(meta, "shell", "settings", "put", "global", k, "0.5")
+
+    # 5. Kolibri launcher (built by guest/launcher/build.sh), installed when present.
+    li = REPO / "guest/launcher/install.sh"
+    if li.exists() and (REPO / "guest/launcher/out/KolibriLauncher.apk").exists():
+        r = subprocess.run(["bash", str(li), serial(meta)], env=env(), capture_output=True, text=True)
+        print("  launcher:", (r.stdout + r.stderr).strip().splitlines()[-1:] or "ok")
+    else:
+        print("  skip launcher (not built yet: guest/launcher)")
+
+    # 5b. A pure system: the only app icons are Settings, Files and Browser (plus the launcher).
+    if not a.no_slim:
+        keep_only_core_apps(meta)
+    # 5b'. Aurora Store, so games can be downloaded (a user app: slimming never touches it).
+    print("  store:", install_store(meta))
+
+    # 5c. Apps get root only when the instance asks for it (anti-cheat and banking apps check su).
+    print("  root:", apply_root(meta, bool(meta.get("root", False))), "| gms:", "on" if meta.get("gms") else "off")
+
+    # 6. Verify and freeze a golden snapshot for instant starts.
+    model = adb(meta, "shell", "getprop", "ro.product.model")
+    rate = adb(meta, "shell", "dumpsys display | grep -m1 -o 'renderFrameRate [0-9.]*'", check=False)
+    time.sleep(2)
+    swap = adb(meta, "shell", "cat /proc/swaps | tail -n +2 | awk '{print $1, $3/1024 \"MB\"}'", check=False)
+    print(f"  swap={swap or 'none'}  hwui={adb(meta, 'shell', 'getprop', 'debug.hwui.renderer')}")
+    print(f"  model={model}  locale={adb(meta, 'shell', 'getprop', 'persist.sys.locale')}  {rate}")
+    meta = load_meta(a.name)
+    meta.update(provisioned=True, profile=profile_name)
+    save_meta(a.name, meta)
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "kolibri-golden", check=False) or "saved")
+    print(f"provisioned {a.name} in {time.time() - t0:.0f}s")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="kolibrictl", description="Kolibri instance manager")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("create", help="create a game-tuned instance")
+    c.add_argument("name")
+    c.add_argument("--resolution", default="1600x900")
+    c.add_argument("--dpi", type=int, default=320)
+    c.add_argument("--cores", type=int, default=4)
+    c.add_argument("--ram", type=int, default=4096, help="MB (API 36 needs >= 2560)")
+    c.add_argument("--refresh", type=int, default=120, help="guest display refresh Hz")
+    # The engine refuses to start unless the Mac has 1.2x the data size free (see cmd_resize).
+    c.add_argument("--data", type=int, default=16, help="data partition GB")
+    c.add_argument("--profile", default="flagship-120", help="device profile (engine/profiles/*.json)")
+    c.add_argument("--image", default=DEFAULT_IMAGE, help="guest image api/tag, e.g. android-32/default")
+    # Every device is a full phone: Google services and Chrome are always there.
+    c.add_argument("--no-gms", dest="gms", action="store_false", help="leave out Google Play services (advanced)")
+    c.add_argument("--root", action="store_true", help="give apps root (su); off by default")
+    c.set_defaults(fn=cmd_create)
+
+    s = sub.add_parser("start", help="start an instance")
+    s.add_argument("name")
+    s.add_argument("--window", action="store_true", help="show the engine's own window (debug)")
+    s.add_argument("--cold", action="store_true", help="full boot, ignore quickboot snapshot")
+    s.add_argument("--writable-system", action="store_true")
+    s.add_argument("--no-wait", action="store_true")
+    s.add_argument("--timeout", type=float, default=180)
+    s.set_defaults(fn=cmd_start)
+
+    sp = sub.add_parser("stop", help="stop (saves quickboot snapshot)")
+    sp.add_argument("name")
+    sp.add_argument("--no-wait", action="store_true", help="return once the save has started")
+    sp.set_defaults(fn=cmd_stop)
+    fs = sub.add_parser("finish-stop", help=argparse.SUPPRESS)  # spawned by stop --no-wait
+    fs.add_argument("name")
+    fs.set_defaults(fn=cmd_finish_stop)
+
+    for nm, fn, hl in (("delete", cmd_delete, "delete instance"),
+                       ("info", cmd_info, "show instance info as JSON")):
+        x = sub.add_parser(nm, help=hl)
+        x.add_argument("name")
+        x.set_defaults(fn=fn)
+
+    su = sub.add_parser("setup", help="download the Android engine, system image and adb (first run)")
+    su.add_argument("--check", action="store_true", help="only report what is missing")
+    su.add_argument("--json", action="store_true")
+    su.add_argument("--accept-licenses", action="store_true", help="accept the Android SDK licenses")
+    su.set_defaults(fn=cmd_setup)
+    rn = sub.add_parser("rename", help="rename a stopped instance")
+    rn.add_argument("name")
+    rn.add_argument("new")
+    rn.set_defaults(fn=cmd_rename)
+    sg = sub.add_parser("storage", help="disk usage, data size and folder of an instance")
+    sg.add_argument("name")
+    sg.add_argument("--json", action="store_true")
+    sg.set_defaults(fn=cmd_storage)
+    cl = sub.add_parser("clean", help="free disk space (trim, drop snapshots, compact images)")
+    cl.add_argument("name")
+    cl.set_defaults(fn=cmd_clean)
+    rz = sub.add_parser("resize", help="grow the data partition (GB)")
+    rz.add_argument("name")
+    rz.add_argument("gb", type=int)
+    rz.set_defaults(fn=cmd_resize)
+    mv = sub.add_parser("move", help="keep an instance's disks in another folder ('default' = ~/.kolibri/avd)")
+    mv.add_argument("name")
+    mv.add_argument("dir")
+    mv.set_defaults(fn=cmd_move)
+
+    aw = sub.add_parser("audio-watch", help=argparse.SUPPRESS)  # started by `start`
+    aw.add_argument("name")
+    aw.set_defaults(fn=cmd_audio_watch)
+
+    st = sub.add_parser("set", help="set instance options (gpu=host|angle, guest_angle=false, ...)")
+    st.add_argument("name")
+    st.add_argument("pairs", nargs="+")
+    st.set_defaults(fn=cmd_set)
+
+    l = sub.add_parser("list", help="list instances")
+    l.add_argument("--json", action="store_true")
+    l.set_defaults(fn=cmd_list)
+
+    d = sub.add_parser("adb", help="run adb against an instance")
+    d.add_argument("name")
+    d.add_argument("args", nargs=argparse.REMAINDER)
+    d.set_defaults(fn=cmd_adb)
+
+    sn = sub.add_parser("snapshot", help="save/load/delete a named snapshot")
+    sn.add_argument("name")
+    sn.add_argument("action", choices=["save", "load", "delete", "list"])
+    sn.add_argument("snapshot", nargs="?", default="kolibri-golden")
+    sn.set_defaults(fn=cmd_snapshot)
+
+    ed = sub.add_parser("edit", help="change performance, display, phone model/GPU, identity")
+    ed.add_argument("name")
+    ed.add_argument("--json", required=True, help='e.g. {"cores":6,"ram_mb":6144,"resolution":[1920,1080]}')
+    ed.set_defaults(fn=cmd_edit)
+    cl = sub.add_parser("clone", help="copy a stopped device")
+    cl.add_argument("src")
+    cl.add_argument("dst")
+    cl.set_defaults(fn=cmd_clone)
+    rs = sub.add_parser("reset", help="factory reset (wipe apps and data, provision again)")
+    rs.add_argument("name")
+    rs.set_defaults(fn=cmd_reset)
+    ri = sub.add_parser("reset-id", help="new Android ID for every app")
+    ri.add_argument("name")
+    ri.set_defaults(fn=cmd_reset_id)
+    st = sub.add_parser("store", help="install Aurora Store (open-source Google Play client)")
+    st.add_argument("name")
+    st.set_defaults(fn=cmd_store)
+    wp = sub.add_parser("wallpaper", help="switch a running instance to the Kolibri wallpaper")
+    wp.add_argument("name")
+    wp.set_defaults(fn=cmd_wallpaper)
+    rp = sub.add_parser("reprofile", help="re-apply a device profile to a running instance")
+    rp.add_argument("name")
+    rp.add_argument("--profile", help="switch to this profile (default: the instance's)")
+    rp.set_defaults(fn=cmd_reprofile)
+    pv = sub.add_parser("provision", help="apply device profile, 120fps unlock, launcher; save golden snapshot")
+    pv.add_argument("name")
+    pv.add_argument("--profile", help="override the instance's profile")
+    pv.add_argument("--locale", default="zh-CN")
+    pv.add_argument("--ram", type=int, help="guest RAM MB (rewrites config; default keeps current)")
+    pv.add_argument("--no-slim", action="store_true", help="keep Google apps/services")
+    pv.set_defaults(fn=cmd_provision)
+
+    for nm, hl in (("gms", "Google Play services on/off"), ("root", "app root (su) on/off")):
+        t = sub.add_parser(nm, help=hl)
+        t.add_argument("name")
+        t.add_argument("state", choices=["on", "off"])
+        t.set_defaults(fn=cmd_toggle, cmd=nm)
+
+    a = p.parse_args()
+    migrate_old_home()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

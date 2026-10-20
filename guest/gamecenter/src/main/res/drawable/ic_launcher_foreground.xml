@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- controller body -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M38,40 L70,40 C80,40 86,47 88,58 L90,68 C91,74 87,78 82,77 C79,76.5 77,74 75,71 L71,65 L37,65 L33,71 C31,74 29,76.5 26,77 C21,78 17,74 18,68 L20,58 C22,47 28,40 38,40 Z" />
+    <!-- d-pad -->
+    <path
+        android:fillColor="#FF1B1530"
+        android:pathData="M35,47 L39,47 L39,51 L43,51 L43,55 L39,55 L39,59 L35,59 L35,55 L31,55 L31,51 L35,51 Z" />
+    <!-- face buttons -->
+    <path
+        android:fillColor="#FF00E5A8"
+        android:pathData="M72,50 m-3,0 a3,3 0,1 0,6 0 a3,3 0,1 0,-6 0" />
+    <path
+        android:fillColor="#FF7C5CFF"
+        android:pathData="M78,56 m-3,0 a3,3 0,1 0,6 0 a3,3 0,1 0,-6 0" />
+</vector>

@@ -1,0 +1,6 @@
+{
+  "title": "不伪装（模拟器原始身份）",
+  "title_en": "Stock (emulator identity)",
+  "stock": true,
+  "refresh_hz": 60
+}

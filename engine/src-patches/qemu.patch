@@ -1,0 +1,40 @@
+diff --git a/android/android-emu/android/userspace-boot-properties.cpp b/android/android-emu/android/userspace-boot-properties.cpp
+index 006ea6c8..a494c322 100644
+--- a/android/android-emu/android/userspace-boot-properties.cpp
++++ b/android/android-emu/android/userspace-boot-properties.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "android/userspace-boot-properties.h"
+ 
++#include <stdlib.h>   // for getenv
+ #include <string.h>   // for strcmp, strchr
+ #include <algorithm>  // for replace_if
+ #include <map>        // for dedup user options
+@@ -548,8 +549,13 @@ std::vector<std::pair<std::string, std::string>> getUserspaceBootProperties(
+         // the host vulkan features/extensions.
+         params.push_back({qemuOpenglesVersionProp, "196609"});
+     } else {
++        // Kolibri: KOLIBRI_GLES_MAX=3.2 advertises ES 3.2 (gfxstream render_control does the
++        // same for the guest driver), so PackageManager reports glEsVersion 0x30002.
++        const char* kolibriGles = getenv("KOLIBRI_GLES_MAX");
++        const bool kolibriGles32 = kolibriGles && !strcmp(kolibriGles, "3.2") &&
++                                   bootPropOpenglesVersion == 196609;
+         params.push_back({qemuOpenglesVersionProp,
+-                        StringFormat("%d", bootPropOpenglesVersion)});
++                        StringFormat("%d", kolibriGles32 ? 196610 : bootPropOpenglesVersion)});
+     }
+ 
+     const char* qemuUirendererPropValue = nullptr;
+diff --git a/android/scripts/unix/gen-android-sdk-toolchain.sh b/android/scripts/unix/gen-android-sdk-toolchain.sh
+index 4d2340fa..ef9266cf 100755
+--- a/android/scripts/unix/gen-android-sdk-toolchain.sh
++++ b/android/scripts/unix/gen-android-sdk-toolchain.sh
+@@ -782,7 +782,7 @@ get_osx_sysroot() {
+     OSX_VERSION=$(sw_vers -productVersion)
+     OSX_REQUIRED=13.3
+     MIN_XCODE=10
+-    OSX_SDK_SUPPORTED="13.3 15.2 15.5 26.0 26.2 26.4"
++    OSX_SDK_SUPPORTED="13.3 15.2 15.5 26.0 26.2 26.4 26.5"
+     OSX_XCODE=$(xcodebuild -version | tr '\n' ' ')
+     OSX_SDK_INSTALLED_LIST=$(xcodebuild -showsdks 2>/dev/null | \
+             egrep --color=never -o " macosx\d+.\d+$" | sed -e "s/.*macosx//g" | sort -n | \

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">游戏中心</string>
+    <string name="tab_my_games">我的游戏</string>
+    <string name="tab_all_apps">全部应用</string>
+    <string name="tab_performance">性能</string>
+    <string name="install_apk">安装 APK</string>
+    <string name="loading">正在扫描已安装的应用…</string>
+
+    <string name="games_count">%1$d 款游戏</string>
+    <string name="apps_count">%1$d 个应用 · 长按可加入「我的游戏」</string>
+    <string name="empty_title">还没有游戏</string>
+    <string name="empty_body">1. 点击左侧「安装 APK」，从文件中选择游戏安装包（.apk）。\n2. 已安装的游戏会被自动识别并显示在这里。\n3. 没被识别？到「全部应用」里长按它，选择「加入我的游戏」。\n4. 在这里长按游戏可以查看应用信息或卸载。</string>
+    <string name="empty_action">从文件安装 APK</string>
+
+    <string name="menu_launch">启动</string>
+    <string name="menu_add_to_games">加入我的游戏</string>
+    <string name="menu_remove_from_games">移出我的游戏</string>
+    <string name="menu_app_info">应用信息</string>
+    <string name="menu_uninstall">卸载</string>
+    <string name="badge_pinned">已固定</string>
+    <string name="cannot_launch">无法启动 %1$s</string>
+
+    <string name="install_need_permission">请允许「游戏中心」安装未知应用，然后重试</string>
+    <string name="install_copying">正在准备安装包…</string>
+    <string name="install_success">安装完成</string>
+    <string name="install_failed">安装失败：%1$s</string>
+    <string name="install_aborted">安装已取消</string>
+    <string name="no_picker">系统中没有可用的文件选择器</string>
+
+    <string name="perf_device">设备</string>
+    <string name="perf_model">型号</string>
+    <string name="perf_brand">品牌 / 厂商</string>
+    <string name="perf_android">Android 版本</string>
+    <string name="perf_abi">CPU 架构</string>
+    <string name="perf_cores">CPU 核心</string>
+    <string name="perf_memory">内存</string>
+    <string name="perf_display">显示</string>
+    <string name="perf_refresh">当前刷新率</string>
+    <string name="perf_resolution">分辨率</string>
+    <string name="perf_modes">支持的显示模式</string>
+    <string name="perf_requested">本窗口请求的模式</string>
+    <string name="perf_requested_none">系统默认</string>
+    <string name="perf_max_refresh">请求最高刷新率</string>
+    <string name="perf_reset">恢复默认</string>
+    <string name="perf_note">演示：只对「游戏中心」自身窗口生效（WindowManager.LayoutParams.preferredDisplayModeId）。若设备只有一个显示模式，刷新率不会变化。</string>
+</resources>

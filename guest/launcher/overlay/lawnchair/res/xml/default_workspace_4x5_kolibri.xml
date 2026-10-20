@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     Kolibri default home layout (4 columns x 5 rows, 3 hotseat icons).
+
+     Part of Kolibri Launcher, a modified version of Lawnchair.
+     Copyright (C) 2026 Kolibri contributors
+
+     This program is free software: you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+     the Free Software Foundation, either version 3 of the License, or
+     (at your option) any later version.
+
+     This program is distributed in the hope that it will be useful,
+     but WITHOUT ANY WARRANTY; without even the implied warranty of
+     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+     GNU General Public License for more details.
+-->
+<favorites xmlns:launcher="http://schemas.android.com/apk/res-auto/com.android.launcher3">
+
+    <!-- Hotseat (container -101; screen == x == position in the hotseat) -->
+    <!-- Settings, Files, Browser: the whole system (no other apps ship) -->
+    <resolve
+        launcher:container="-101"
+        launcher:screen="0"
+        launcher:x="0"
+        launcher:y="0" >
+        <favorite launcher:uri="#Intent;action=android.settings.SETTINGS;end" />
+        <favorite
+            launcher:className="com.android.settings.Settings"
+            launcher:packageName="com.android.settings" />
+    </resolve>
+
+
+    <resolve
+        launcher:container="-101"
+        launcher:screen="1"
+        launcher:x="1"
+        launcher:y="0" >
+        <favorite
+            launcher:className="com.android.documentsui.files.FilesActivity"
+            launcher:packageName="com.android.documentsui" />
+        <favorite
+            launcher:className="com.android.documentsui.LauncherActivity"
+            launcher:packageName="com.android.documentsui" />
+        <!-- google_apis images ship the Google-branded DocumentsUI package -->
+        <favorite
+            launcher:className="com.android.documentsui.LauncherActivity"
+            launcher:packageName="com.google.android.documentsui" />
+        <favorite
+            launcher:className="com.android.documentsui.files.FilesActivity"
+            launcher:packageName="com.google.android.documentsui" />
+    </resolve>
+
+    <resolve
+        launcher:container="-101"
+        launcher:screen="2"
+        launcher:x="2"
+        launcher:y="0" >
+        <favorite launcher:uri="#Intent;action=android.intent.action.MAIN;category=android.intent.category.APP_BROWSER;end" />
+        <favorite launcher:uri="https://github.com/kolibri/kolibri" />
+    </resolve>
+
+</favorites>

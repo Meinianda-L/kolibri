@@ -1,0 +1,16 @@
+{
+  "title": "小米 14",
+  "title_en": "Xiaomi 14",
+  "brand": "Xiaomi",
+  "manufacturer": "Xiaomi",
+  "model": "23127PN0CC",
+  "device": "houji",
+  "product": "houji",
+  "board": "pineapple",
+  "platform": "pineapple",
+  "hardware": "qcom",
+  "soc_manufacturer": "QTI",
+  "soc_model": "SM8650",
+  "gpu_renderer": "Adreno (TM) 750",
+  "refresh_hz": 120
+}
