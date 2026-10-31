@@ -10,7 +10,14 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Kolibri"
 rsync -a --exclude '__pycache__' ../engine/ "$APP/Contents/Resources/engine/"
-cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # from Resources/AppIcon.svg
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # from Resources/AppIcon.svg (macOS 15)
+# macOS 26 icon (Icon Composer format, Resources/AppIcon.icon): without it the system shrinks
+# the legacy .icns into a gray square plate.
+ICONTMP="$(mktemp -d)"
+xcrun actool Resources/AppIcon.icon --compile "$ICONTMP" --platform macosx --minimum-deployment-target 15.0 \
+    --app-icon AppIcon --output-partial-info-plist "$ICONTMP/partial.plist" >/dev/null
+cp "$ICONTMP/Assets.car" "$APP/Contents/Resources/Assets.car"
+rm -rf "$ICONTMP"
 mkdir -p "$APP/Contents/Resources/guest/wallpaper"                 # kolibrictl looks next to engine/
 cp ../guest/wallpaper/*.png "$APP/Contents/Resources/guest/wallpaper/"
 # Prebuilt Vulkan shim, so users don't need a compiler.
@@ -18,6 +25,12 @@ mkdir -p "$APP/Contents/Resources/engine/glshim/prebuilt"
 clang -O2 -dynamiclib -arch arm64 -fvisibility=hidden -install_name "@loader_path/libkolibrivk.dylib" \
     -o "$APP/Contents/Resources/engine/glshim/prebuilt/libkolibrivk.dylib" ../engine/glshim/vkshim.c
 codesign --force --sign - "$APP/Contents/Resources/engine/glshim/prebuilt/libkolibrivk.dylib" >/dev/null
+# The Android engine built from source (engine/src-patches), trimmed to what Kolibri runs.
+if [ -d "${KOLIBRI_ENGINE_SRC:-$HOME/emulator-src/objs-emu}" ]; then
+    ../tools/package-engine.sh "${KOLIBRI_ENGINE_SRC:-$HOME/emulator-src/objs-emu}" "$APP/Contents/Resources/engine-bin"
+else
+    echo "warning: no engine build found; the app will download Google's engine on first launch" >&2
+fi
 # Kolibri Launcher (guest home app); built by guest/launcher/build.sh.
 if [ -f ../guest/launcher/out/KolibriLauncher.apk ]; then
     mkdir -p "$APP/Contents/Resources/guest/launcher/out"
@@ -36,6 +49,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>dev.kolibri.app</string>
   <key>CFBundleExecutable</key><string>Kolibri</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION:-0.1.0}</string>
   <key>CFBundleVersion</key><string>1</string>

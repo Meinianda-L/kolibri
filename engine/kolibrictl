@@ -26,7 +26,7 @@ def _find_sdk() -> Path:
     if env_sdk:
         return Path(env_sdk)
     studio = Path.home() / "Library/Android/sdk"
-    if (studio / "emulator/emulator").exists():
+    if (studio / "emulator/emulator").exists() or (studio / "system-images/android-36/google_apis/arm64-v8a/system.img").exists():
         return studio
     return Path(os.environ.get("KOLIBRI_HOME", Path.home() / ".kolibri")) / "sdk"
 
@@ -215,7 +215,16 @@ def wait_boot(meta: dict, timeout: float) -> float:
 # Self-built engine (opt-in per instance: `kolibrictl set <name> engine=src`): the build
 # tree of ~/emulator-src (external/qemu, cmake.py --out objs-emu) is itself a runnable
 # engine layout; only these entries are cloned out of it (the rest is objects and tests).
-SRC_ENGINE = Path(os.environ.get("KOLIBRI_ENGINE_SRC", Path.home() / "emulator-src/objs-emu"))
+# The engine built from source (engine/src-patches): shipped inside the app as engine-bin
+# (tools/package-engine.sh); in a dev checkout, the build tree.
+BUNDLED_ENGINE = ENGINE_DIR.parent / "engine-bin"
+SRC_ENGINE = Path(os.environ.get("KOLIBRI_ENGINE_SRC") or
+                  (BUNDLED_ENGINE if BUNDLED_ENGINE.exists() else Path.home() / "emulator-src/objs-emu"))
+
+
+def engine_kind(meta: dict) -> str:
+    """"src" (built from source, the default when the app ships it) or "sdk" (Google's)."""
+    return meta.get("engine") or ("src" if BUNDLED_ENGINE.exists() else "sdk")
 SRC_ENGINE_ENTRIES = ("emulator", "emulator-check", "qemu", "qemu-img", "lib", "lib64", "bin64",
                       "resources", "crashpad_handler", "netsimd", "mksdcard", "source.properties")
 
@@ -225,7 +234,7 @@ def engine_root(meta: dict) -> Path:
     with Kolibri's shims in front of MoltenVK (GPU name for games) and, for host-GLES
     instances, in front of ANGLE. The SDK itself is never modified.
     engine=src instances run a clone of the engine built from source instead."""
-    from_src = meta.get("engine") == "src"
+    from_src = engine_kind(meta) == "src"
     sdk_engine = SRC_ENGINE if from_src else SDK / "emulator"
     clone = KOLIBRI_HOME / "engine" / ("emulator-src" if from_src else "emulator")
     stamp = clone / ".kolibri-source"
@@ -332,7 +341,7 @@ def cmd_start(a: argparse.Namespace) -> None:
     # default; a 4 GB save can take longer, and a cut-short save means a slow cold boot next
     # time. Give it room (stop no longer blocks the UI while it saves).
     eng_env.setdefault("ANDROID_EMULATOR_WAIT_TIME_BEFORE_KILL", "120")
-    if meta.get("engine") == "src":
+    if engine_kind(meta) == "src":
         # 37.2's CoreAudio voice buffer is only a few periods long; at the default 100 Hz audio
         # timer QEMU refilled ~6% of real time (choppy sound, near-empty gRPC audio stream).
         eng_env.setdefault("QEMU_AUDIO_TIMER_PERIOD", "500")
@@ -363,7 +372,7 @@ def cmd_start(a: argparse.Namespace) -> None:
         eng_env.update({"ANDROID_EGL_ON_EGL": "1", "ANGLE_DEFAULT_PLATFORM": "vulkan",
                         "KOLIBRI_GPU_RENDERER": renderer,
                         "KOLIBRI_GPU_VENDOR": meta.get("gpu_vendor", prof.get("gpu_vendor", default_vendor))})
-        if meta.get("engine") == "src":
+        if engine_kind(meta) == "src":
             # The self-built gfxstream reports these to the guest driver itself
             # (engine/src-patches/gfxstream.patch): ES 3.2 like other Mac emulators (the host context stays
             # ES 3.1: ANGLE on MoltenVK has no geometry shaders) and a phone-style GL_VERSION
@@ -377,7 +386,7 @@ def cmd_start(a: argparse.Namespace) -> None:
     # and publishes them in this header; the frontend samples them instead of the gRPC stream.
     iosurface_hdr = avd_dir(a.name) / "frame-iosurface.bin"
     iosurface_hdr.unlink(missing_ok=True)
-    if meta.get("engine") == "src" and meta.get("iosurface", True):
+    if engine_kind(meta) == "src" and meta.get("iosurface", True):
         eng_env["KOLIBRI_IOSURFACE_HEADER"] = str(iosurface_hdr)
     eng_env.update({k: str(v) for k, v in meta.get("env", {}).items()})
     proc = subprocess.Popen(
@@ -506,7 +515,9 @@ LICENSE_SOURCES = [REPO_URL + "repository2-3.xml", REPO_URL + "sys-img/google_ap
 
 
 def missing_packages() -> list[dict]:
-    return [p for p in SDK_PACKAGES if not (SDK / p["check"]).exists()]
+    # An app that ships the engine built from source doesn't need Google's.
+    return [p for p in SDK_PACKAGES if not (SDK / p["check"]).exists()
+            and not (p["id"] == "emulator" and BUNDLED_ENGINE.exists())]
 
 
 def fetch_licenses(ids: set[str]) -> dict:
@@ -1362,6 +1373,20 @@ def cmd_rename(a: argparse.Namespace) -> None:
     write_avd_ini(a.new, meta.get("image", DEFAULT_IMAGE))
     print(f"renamed {a.name} -> {a.new}")
 
+def cmd_slim(a: argparse.Namespace) -> None:
+    """kolibrictl slim <name> — apply engine/slim/remove.txt to a running phone (system parts
+    games don't use; apps and their data are never touched). Reversible per package with
+    `pm install-existing --user 0 <pkg>`."""
+    meta = load_meta(a.name)
+    if not running_pid(meta):
+        die(f"{a.name} not running (start it first)")
+    adb_retry(meta, "root")
+    wait_boot(meta, 60)
+    ensure_root_remount(meta)
+    slim_guest(meta)
+    settle(meta)
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "default_boot", check=False) or "saved")
+
 def cmd_reset(a: argparse.Namespace) -> None:
     """kolibrictl reset <name> — factory reset: wipe apps and data, then provision again
     (same phone model, resolution and performance settings)."""
@@ -1519,7 +1544,7 @@ def main() -> None:
     c.add_argument("--resolution", default="1600x900")
     c.add_argument("--dpi", type=int, default=320)
     c.add_argument("--cores", type=int, default=4)
-    c.add_argument("--ram", type=int, default=4096, help="MB (API 36 needs >= 2560)")
+    c.add_argument("--ram", type=int, default=3072, help="MB (API 36 needs >= 2560)")
     c.add_argument("--refresh", type=int, default=120, help="guest display refresh Hz")
     # The engine refuses to start unless the Mac has 1.2x the data size free (see cmd_resize).
     c.add_argument("--data", type=int, default=16, help="data partition GB")
@@ -1558,6 +1583,9 @@ def main() -> None:
     su.add_argument("--json", action="store_true")
     su.add_argument("--accept-licenses", action="store_true", help="accept the Android SDK licenses")
     su.set_defaults(fn=cmd_setup)
+    sl = sub.add_parser("slim", help="remove system parts games don't use (running instance)")
+    sl.add_argument("name")
+    sl.set_defaults(fn=cmd_slim)
     rn = sub.add_parser("rename", help="rename a stopped instance")
     rn.add_argument("name")
     rn.add_argument("new")

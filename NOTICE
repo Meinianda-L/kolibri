@@ -3,9 +3,12 @@ Kolibri is MIT-licensed (see LICENSE), with these exceptions:
 
 - guest/launcher/ (patches and overlay for Lawnchair, which is GPL-3.0):
   GNU General Public License v3.0 or later. See guest/launcher/LICENSE.
+- The Android engine shipped in the app (Contents/Resources/engine-bin) is built from the
+  Android Emulator sources: QEMU is GPL-2.0, most of the rest Apache-2.0. Exact sources and
+  build steps: engine/src-patches/ (SOURCES.txt, README.md).
 - engine/src-patches/qemu.patch (changes to QEMU): GPL-2.0, like QEMU.
 - engine/src-patches/gfxstream.patch (changes to gfxstream): Apache-2.0, like gfxstream.
 
-The Android Emulator, Android system images and platform tools that Kolibri
-downloads on first launch are Google's and come under the Android SDK License
+The Android system image and platform tools that Kolibri downloads on first
+launch are Google's and come under the Android SDK License
 Agreement; they are not part of this repository.

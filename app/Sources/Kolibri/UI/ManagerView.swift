@@ -331,7 +331,7 @@ struct CreateInstanceSheet: View {
     @State private var resolution = "1600x900"
     @State private var refresh = 120
     @State private var cores = 4
-    @State private var ramGB = 4
+    @State private var ramGB = 3   // enough for big games; the Mac keeps all of it resident after a resume
     @State private var profile = "flagship-120"
     @State private var root = false
     @State private var error: String?

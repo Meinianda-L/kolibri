@@ -7,7 +7,7 @@ for P in "$@"; do
   echo "== $P"
   dir=$(ls -d $SRC/app/*/$P-* 2>/dev/null | head -1)
   [ -z "$dir" ] && { echo "  no apk, skipped"; continue; }
-  sid=$(pm install-create -r -g | grep -o '[0-9][0-9]*')
+  sid=$(pm install-create -r | grep -o '[0-9][0-9]*')
   for f in $dir/*.apk; do
     cat "$f" | pm install-write -S $(stat -c %s "$f") $sid $(basename "$f") - >/dev/null || echo "  write failed: $f"
   done
