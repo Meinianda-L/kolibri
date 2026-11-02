@@ -56,12 +56,13 @@ def migrate_old_home() -> None:
     for meta in (KOLIBRI_HOME / "avd").glob("*.avd/voltplay.json"):
         meta.rename(meta.with_name("kolibri.json"))
     print(f"moved {OLD_HOME} -> {KOLIBRI_HOME}", file=sys.stderr)
-DEFAULT_IMAGE = "android-36/google_apis"   # Android 16, kernel 6.x; slimmed to Settings/Files/Browser
+DEFAULT_IMAGE = "android-32/kolibri"   # Kolibri's own Android 12 (tools/aosp), from the GitHub release
+GOOGLE_IMAGE = "android-36/google_apis"  # Google's Android 16, for phones created before 0.3.0
 
 
 def kolibri_image(meta: dict) -> bool:
     """Kolibri's own Android image (tools/aosp), as opposed to a Google system image."""
-    return meta.get("image", DEFAULT_IMAGE).endswith("/kolibri")
+    return meta.get("image", GOOGLE_IMAGE).endswith("/kolibri")
 
 
 def boot_profile(meta: dict) -> bool:
@@ -134,9 +135,9 @@ def render_config(meta: dict) -> str:
     w, h = meta["resolution"]
     return tpl.format(
         name=meta["name"],
-        sysdir=sysimg_rel(meta.get("image", "android-36/google_apis")),
-        target=meta.get("image", "android-36/google_apis").split("/")[0],
-        tag=meta.get("image", "android-36/google_apis").split("/")[1],
+        sysdir=sysimg_rel(meta.get("image", GOOGLE_IMAGE)),
+        target=meta.get("image", GOOGLE_IMAGE).split("/")[0],
+        tag=meta.get("image", GOOGLE_IMAGE).split("/")[1],
         cores=meta["cores"],
         ram=meta["ram_mb"],
         width=w,
@@ -165,7 +166,7 @@ def cmd_create(a: argparse.Namespace) -> None:
         "data_gb": a.data,
         "profile": a.profile,
         "image": a.image,
-        "gms": a.gms,
+        "gms": a.gms and not a.image.endswith("/kolibri"),
         "root": a.root,
         "provisioned": False,
         "created": int(time.time()),
@@ -521,7 +522,13 @@ SDK_PACKAGES = [
      "url": REPO_URL + "emulator-darwin_aarch64-15507667.zip",
      "sha1": "45328141bb585e096a5bebf870ff351e140bcda3", "size": 383903546,
      "license": "android-sdk-license", "check": "emulator/emulator", "root": "emulator", "into": ""},
-    {"id": "system-image", "title": "Android 16 system image (Google APIs, ARM64)",
+    {"id": "kolibri-image", "title": "Kolibri Android 12 system",
+     "url": "https://github.com/Meinianda-L/kolibri/releases/download/v0.3.0/Kolibri-Android12-arm64-20261102.zip",
+     "sha1": "580b8ed2704879e0c06d61fa3650c25483f7c47c", "size": 592334536,
+     "license": None, "check": "system-images/android-32/kolibri/arm64-v8a/system.img",
+     "root": "arm64-v8a", "into": "system-images/android-32/kolibri"},
+    # Only fetched while a phone still uses it (see missing_packages).
+    {"id": "system-image", "image": GOOGLE_IMAGE, "title": "Android 16 system image (Google APIs, ARM64)",
      "url": REPO_URL + "sys-img/google_apis/arm64-v8a-36_r07.zip",
      "sha1": "5a99183b6d924da606260e45fd41a3eb8eca6eb7", "size": 1872691175,
      "license": "android-sdk-arm-dbt-license", "check": "system-images/android-36/google_apis/arm64-v8a/system.img",
@@ -531,9 +538,12 @@ LICENSE_SOURCES = [REPO_URL + "repository2-3.xml", REPO_URL + "sys-img/google_ap
 
 
 def missing_packages() -> list[dict]:
-    # An app that ships the engine built from source doesn't need Google's.
+    # An app that ships the engine built from source doesn't need Google's, and Google's
+    # system image is only needed by phones created on it.
+    used = {load_meta(n).get("image", GOOGLE_IMAGE) for n in instances()}
     return [p for p in SDK_PACKAGES if not (SDK / p["check"]).exists()
-            and not (p["id"] == "emulator" and BUNDLED_ENGINE.exists())]
+            and not (p["id"] == "emulator" and BUNDLED_ENGINE.exists())
+            and (p.get("image") is None or p["image"] in used)]
 
 
 def fetch_licenses(ids: set[str]) -> dict:
@@ -560,7 +570,7 @@ def cmd_setup(a: argparse.Namespace) -> None:
         info = {"ready": not missing, "sdk": str(SDK), "missing": [p["title"] for p in missing],
                 "bytes": sum(p["size"] for p in missing)}
         if missing and a.json:
-            info["licenses"] = fetch_licenses({p["license"] for p in missing})
+            info["licenses"] = fetch_licenses({p["license"] for p in missing if p["license"]})
         print(json.dumps(info, ensure_ascii=False) if a.json else
               ("ready" if not missing else "missing: " + ", ".join(info["missing"])))
         return
@@ -606,7 +616,7 @@ def cmd_setup(a: argparse.Namespace) -> None:
         zip_path.unlink(missing_ok=True)
         done_before += p["size"]
     (KOLIBRI_HOME / "licenses-accepted").write_text(
-        "\n".join(sorted({p["license"] for p in SDK_PACKAGES})) + "\n")
+        "\n".join(sorted({p["license"] for p in SDK_PACKAGES if p["license"]})) + "\n")
     print(json.dumps({"done": True}) if a.json else f"installed into {SDK}", flush=True)
 
 
@@ -1204,7 +1214,7 @@ def cmd_clone(a: argparse.Namespace) -> None:
     meta.pop("pid", None)
     save_meta(a.dst, meta)
     (d / "config.ini").write_text(render_config(meta))
-    write_avd_ini(a.dst, meta.get("image", DEFAULT_IMAGE))
+    write_avd_ini(a.dst, meta.get("image", GOOGLE_IMAGE))
     print(f"cloned {a.src} -> {a.dst} (slot {meta['slot']})")
 
 
@@ -1392,7 +1402,7 @@ def cmd_rename(a: argparse.Namespace) -> None:
     meta["name"] = a.new
     save_meta(a.new, meta)
     (d / "config.ini").write_text(render_config(meta))
-    write_avd_ini(a.new, meta.get("image", DEFAULT_IMAGE))
+    write_avd_ini(a.new, meta.get("image", GOOGLE_IMAGE))
     print(f"renamed {a.name} -> {a.new}")
 
 def cmd_slim(a: argparse.Namespace) -> None:

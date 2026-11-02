@@ -22,7 +22,7 @@
   <a href="README.zh-CN.md">中文</a>
 </p>
 
-Kolibri runs Android 16 on your Mac through the open-source Android Emulator engine, using the
+Kolibri runs Android on your Mac through the open-source Android Emulator engine, using the
 Hypervisor framework for the CPU and Vulkan over MoltenVK for graphics. On top of it is a native
 SwiftUI app built for playing games: keyboard, mouse and gamepad mapping, up to 120 Hz, several phones
 at once, drag-and-drop installs and screen recording.
@@ -47,8 +47,8 @@ You can also download `Kolibri-<version>-macOS-arm64.zip` from
 [Releases](https://github.com/Meinianda-L/kolibri/releases/latest). The app isn't notarized, so a
 browser download needs `xattr -dr com.apple.quarantine /Applications/Kolibri.app` once.
 
-On first launch Kolibri downloads the Android 16 system image from Google (about 1.9 GB) after you
-accept the Android SDK license. If macOS offers to install the Command Line Tools, accept: Kolibri's
+On first launch Kolibri downloads its own Android 12 system from this project's releases (about
+590 MB) and adb from Google (after you accept the Android SDK license). If macOS offers to install the Command Line Tools, accept: Kolibri's
 device tool runs on the Python they include.
 
 Requirements: an Apple Silicon Mac, macOS 15 or later, about 10 GB of free disk space.
@@ -107,7 +107,7 @@ display was attached.
 ## How it works
 
 ```
-Kolibri.app (SwiftUI)  <-- gRPC, shared memory -->  Android Emulator engine  -->  Android 16 (arm64)
+Kolibri.app (SwiftUI)  <-- gRPC, shared memory -->  Android Emulator engine  -->  Android 12 (arm64)
   input, keymaps, Metal                             QEMU + HVF, gfxstream          GLES through ANGLE
   recording, settings                               Vulkan -> MoltenVK -> Metal    slimmed system
 ```
@@ -152,14 +152,15 @@ tools/aosp/build.sh                                   # first build: about a day
 engine/kolibrictl create phone2 --image android-32/kolibri --no-gms
 ```
 
-The source checkout (about 70 GB) follows `tools/aosp/manifest-android-12.1.0_r27.xml`. The release
-still downloads Google's Android 16 image by default.
+The source checkout (about 70 GB) follows `tools/aosp/manifest-android-12.1.0_r27.xml`. Since 0.3.0
+new phones use this image; phones created earlier keep Google's Android 16 image.
 
 ## License
 
 Kolibri is released under the [MIT License](LICENSE). The launcher in `guest/launcher/` is GPL-3.0,
 and the bundled engine keeps the licenses of its sources (QEMU GPL-2.0, most of the rest Apache-2.0);
-see [NOTICE](NOTICE). The Android system image is downloaded from Google under the Android SDK License
-Agreement and is not part of this repository.
+see [NOTICE](NOTICE). The Android system is built from AOSP (Apache-2.0, kernel GPL-2.0) and published
+as a release asset; adb and the older Android 16 image come from Google under the Android SDK License
+Agreement.
 
 Kolibri is not affiliated with Google. Android is a trademark of Google LLC.

@@ -1,7 +1,7 @@
 import SwiftUI
 import KolibriCore
 
-/// First launch: the Android engine, Android 16 system image and adb come from Google
+/// First launch: Kolibri's Android 12 system (GitHub release) and adb (Google) are downloaded
 /// (Android SDK licenses), so they are downloaded here instead of shipping with the app.
 struct SetupSheet: View {
     struct Check: Decodable {
@@ -25,7 +25,7 @@ struct SetupSheet: View {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 56, height: 56)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(L("下载安卓组件")).font(.title2.weight(.semibold))
-                    Text(L("Kolibri 需要 Google 的安卓模拟器引擎和安卓 16 系统镜像（约 {} GB），只需下载一次。")
+                    Text(L("Kolibri 需要下载自己的安卓 12 系统和 adb 工具（约 {} GB），只需下载一次。")
                         .replacingOccurrences(of: "{}", with: String(format: "%.1f", Double(check.bytes) / 1e9)))
                         .foregroundStyle(.secondary)
                 }
@@ -69,7 +69,7 @@ struct SetupSheet: View {
     private func download() {
         progress = 0
         error = nil
-        current = L("连接 Google 下载服务器…")
+        current = L("连接下载服务器…")
         Task {
             do {
                 try await KolibriCtl.stream(["setup", "--accept-licenses", "--json"]) { line in

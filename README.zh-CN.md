@@ -22,7 +22,7 @@
   <a href="README.md">English</a>
 </p>
 
-Kolibri 基于开源的 Android Emulator 引擎在 Mac 上运行安卓 16：CPU 用 Hypervisor 框架虚拟化，图形走
+Kolibri 基于开源的 Android Emulator 引擎在 Mac 上运行安卓：CPU 用 Hypervisor 框架虚拟化，图形走
 Vulkan → MoltenVK → Metal。外层是一个为玩游戏做的原生 SwiftUI 程序：键鼠和手柄映射、最高 120 Hz、多台手机同时运行、
 拖拽安装和录屏。
 
@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/Meinianda-L/kolibri/main/install.sh
 [Releases](https://github.com/Meinianda-L/kolibri/releases/latest) 下载 `Kolibri-<版本>-macOS-arm64.zip`。
 程序没有经过苹果公证，用浏览器下载的需要先运行一次 `xattr -dr com.apple.quarantine /Applications/Kolibri.app`。
 
-首次启动时，同意 Android SDK 许可协议后会从 Google 下载安卓 16 系统镜像（约 1.9 GB）。如果系统提示安装命令行开发者工具，
+首次启动时会从本项目的 Release 下载 Kolibri 自己的安卓 12 系统（约 590 MB），并在同意 Android SDK 许可协议后从 Google 下载 adb。如果系统提示安装命令行开发者工具，
 请同意：Kolibri 的设备管理工具使用其中的 Python。
 
 系统要求：Apple Silicon Mac、macOS 15 及以上、约 10 GB 可用空间。
@@ -95,7 +95,7 @@ curl -fsSL https://raw.githubusercontent.com/Meinianda-L/kolibri/main/install.sh
 ## 工作原理
 
 ```
-Kolibri.app (SwiftUI)  <-- gRPC、共享内存 -->  Android Emulator 引擎       -->  安卓 16 (arm64)
+Kolibri.app (SwiftUI)  <-- gRPC、共享内存 -->  Android Emulator 引擎       -->  安卓 12 (arm64)
   输入、键位、Metal                            QEMU + HVF、gfxstream            GLES 由 ANGLE 处理
   录制、设置                                   Vulkan -> MoltenVK -> Metal      精简系统
 ```
@@ -138,11 +138,11 @@ tools/aosp/build.sh                                   # 首次编译约一天，
 engine/kolibrictl create phone2 --image android-32/kolibri --no-gms
 ```
 
-源码（约 70 GB）按 `tools/aosp/manifest-android-12.1.0_r27.xml` 同步。发布版目前默认仍下载 Google 的安卓 16 镜像。
+源码（约 70 GB）按 `tools/aosp/manifest-android-12.1.0_r27.xml` 同步。从 0.3.0 起新建的手机都用这个系统；之前建的手机继续用 Google 的安卓 16 镜像。
 
 ## 许可证
 
 Kolibri 以 [MIT 许可证](LICENSE) 发布。`guest/launcher/` 中的桌面为 GPL-3.0，内置引擎沿用其源码的许可证（QEMU 为 GPL-2.0，
-其余大多为 Apache-2.0），详见 [NOTICE](NOTICE)。安卓系统镜像从 Google 下载，受 Android SDK 许可协议约束，不包含在本仓库中。
+其余大多为 Apache-2.0），详见 [NOTICE](NOTICE)。安卓系统从 AOSP 编译（Apache-2.0，内核为 GPL-2.0），作为 Release 附件发布；adb 和旧的安卓 16 镜像从 Google 下载，受 Android SDK 许可协议约束。
 
 Kolibri 与 Google 无关。Android 是 Google LLC 的商标。
