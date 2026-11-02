@@ -1,0 +1,41 @@
+# Linux VM that builds Kolibri's Android image (AOSP 12L, emulator target) on this Mac:
+# Ubuntu 22.04 arm64 on Apple's Virtualization framework, with Rosetta so AOSP's x86_64
+# host tools (clang, soong, ...) run. Source and build output live on the VM's own disk:
+# building over virtiofs runs into macOS's open-file limits. Fetch the source with
+# `repo init -m manifest-android-12.1.0_r27.xml` (see build.sh) into ~/aosp in the VM.
+#   limactl create --name aosp tools/aosp/lima-aosp.yaml && limactl start aosp
+vmType: vz
+mountType: virtiofs
+rosetta:
+  enabled: true
+  binfmt: true
+cpus: 8
+memory: 12GiB
+disk: 200GiB          # sparse: source (~65 GB) + build output (~80-100 GB) + swap
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+mounts:
+  - location: "~/emulator/tools/aosp"
+    writable: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      dpkg --add-architecture amd64
+      sed -i 's|^deb http|deb [arch=arm64] http|' /etc/apt/sources.list
+      cat > /etc/apt/sources.list.d/amd64.list <<'SRC'
+      deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main universe
+      deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main universe
+      deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main universe
+      SRC
+      apt-get update
+      # AOSP 12 host deps; x86_64 runtime libs for the Rosetta-run prebuilts.
+      apt-get install -y git curl python3 python-is-python3 zip unzip rsync bc \
+        build-essential flex bison libssl-dev zstd xz-utils fontconfig \
+        libc6:amd64 libstdc++6:amd64 zlib1g:amd64 libncurses5:amd64 libtinfo5:amd64 libgcc-s1:amd64
+      # 16 GB host: swap so soong/ninja peaks don't OOM.
+      if [ ! -f /swapfile ]; then fallocate -l 16G /swapfile && chmod 600 /swapfile && mkswap /swapfile; fi
+      swapon /swapfile || true
+      grep -q swapfile /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
