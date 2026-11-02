@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <bool name="def_bluetooth_on">false</bool>
+    <bool name="def_stay_on_while_plugged_in">true</bool>
+    <fraction name="def_window_animation_scale">50%</fraction>
+    <fraction name="def_transition_animation_scale">50%</fraction>
+</resources>

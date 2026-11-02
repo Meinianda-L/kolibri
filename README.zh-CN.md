@@ -26,6 +26,9 @@ Kolibri 基于开源的 Android Emulator 引擎在 Mac 上运行安卓 16：CPU 
 Vulkan → MoltenVK → Metal。外层是一个为玩游戏做的原生 SwiftUI 程序：键鼠和手柄映射、最高 120 Hz、多台手机同时运行、
 拖拽安装和录屏。
 
+引擎和安卓系统都可以从源码自己编译：内置引擎由 Android Emulator 源码编译而来；`tools/aosp` 则在 Mac 上从 AOSP
+编译 Kolibri 自己的安卓 12 系统：深色界面、Kolibri 桌面作为唯一桌面、没有任务栏和导航栏、开机时选择机型。
+
 <p align="center">
   <img src="docs/screenshots/devices-zh.png" width="860" alt="设备管理">
 </p>
@@ -105,6 +108,7 @@ Kolibri.app (SwiftUI)  <-- gRPC、共享内存 -->  Android Emulator 引擎     
 | `engine/src-patches/` | 内置引擎的补丁和准确的源码版本 |
 | `engine/slim/` | 每台手机都会移除的系统组件 |
 | `guest/` | 手机里的桌面（基于 Lawnchair，用补丁构建）和壁纸 |
+| `tools/aosp/` | Kolibri 自己的安卓 12 系统，在 Mac 上的 Linux 虚拟机里从 AOSP 编译 |
 
 ## 从源码编译
 
@@ -121,6 +125,20 @@ engine/kolibrictl setup --accept-licenses
 engine/kolibrictl create phone1 --resolution 1920x1080 --refresh 120
 engine/kolibrictl provision phone1 && engine/kolibrictl start phone1
 ```
+
+### 自编译安卓系统
+
+`tools/aosp` 为引擎编译一个精简的安卓 12（AOSP 12L，`android-12.1.0_r27`），全程只用一台 Apple Silicon Mac：
+Lima 虚拟机通过 Rosetta 运行 x86_64 编译工具。镜像压缩后约 590 MB（Google 镜像下载为 1.9 GB），冷启动约 20 秒；
+所有机型都编进了系统、开机时选择，手机不需要可写的系统分区。
+
+```bash
+limactl start --name aosp tools/aosp/lima-aosp.yaml && limactl shell aosp sudo bash "$PWD/tools/aosp/vm-setup.sh"
+tools/aosp/build.sh                                   # 首次编译约一天，之后几分钟
+engine/kolibrictl create phone2 --image android-32/kolibri --no-gms
+```
+
+源码（约 70 GB）按 `tools/aosp/manifest-android-12.1.0_r27.xml` 同步。发布版目前默认仍下载 Google 的安卓 16 镜像。
 
 ## 许可证
 

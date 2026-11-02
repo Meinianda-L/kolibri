@@ -59,6 +59,16 @@ def migrate_old_home() -> None:
 DEFAULT_IMAGE = "android-36/google_apis"   # Android 16, kernel 6.x; slimmed to Settings/Files/Browser
 
 
+def kolibri_image(meta: dict) -> bool:
+    """Kolibri's own Android image (tools/aosp), as opposed to a Google system image."""
+    return meta.get("image", DEFAULT_IMAGE).endswith("/kolibri")
+
+
+def boot_profile(meta: dict) -> bool:
+    """Identity comes from the image at boot (a preset profile on Kolibri's image)."""
+    return kolibri_image(meta) and meta.get("profile", "stock") != "custom"
+
+
 def sysimg_rel(image: str) -> str:
     api, tag = image.split("/")
     return f"system-images/{api}/{tag}/arm64-v8a/"
@@ -319,6 +329,12 @@ def engine_args(meta: dict, a: argparse.Namespace) -> list[str]:
         args += ["-phone-number", str(meta["phone_number"])]
     if getattr(a, "writable_system", False) or meta.get("writable_system"):
         args.append("-writable-system")
+    if kolibri_image(meta) and (PROFILES_DIR / f"{meta.get('profile', 'stock')}.json").exists():
+        # Kolibri's image ships every preset profile and imports the one named here at boot,
+        # so identity needs no writable system or provisioning reboot ("custom" still does).
+        args += ["-append-userspace-opt", f"androidboot.kolibri.profile={meta.get('profile', 'stock')}"]
+    if kolibri_image(meta) and meta.get("root"):
+        args += ["-append-userspace-opt", "androidboot.kolibri.root=1"]   # else the image hides su
     if meta.get("qemu_args"):
         args += ["-qemu", *meta["qemu_args"]]  # must stay last: everything after -qemu goes to QEMU
     return args
@@ -957,6 +973,11 @@ def apply_gms(meta: dict, on: bool) -> str:
 
 def apply_root(meta: dict, on: bool) -> str:
     """Root for apps (su). Off hides the su binary; kolibrictl itself uses adbd root, not su."""
+    if kolibri_image(meta):
+        # Decided at boot from meta["root"] (androidboot.kolibri.root): restart if it differs.
+        if (adb(meta, "shell", "getprop", "ro.boot.kolibri.root") == "1") != on:
+            reboot_and_wait(meta)
+        return "su present" if adb(meta, "shell", f"[ -e {SU_PATH} ] && echo yes", check=False) == "yes" else "su hidden"
     ensure_root_remount(meta)
     if on:
         adb(meta, "shell", f"[ -e {SU_HIDDEN} ] && mv {SU_HIDDEN} {SU_PATH}; true")
@@ -1132,8 +1153,9 @@ def cmd_edit(a: argparse.Namespace) -> None:
     adb_retry(meta, "root")
     wait_boot(meta, 120)
     if EDIT_ID_KEYS & changes.keys():
-        ensure_root_remount(meta)
-        write_identity(meta, device_profile(meta))
+        if not boot_profile(meta):
+            ensure_root_remount(meta)
+            write_identity(meta, device_profile(meta))
         reboot_and_wait(meta)
         adb_retry(meta, "root")
         wait_boot(meta, 120)
@@ -1457,12 +1479,46 @@ def settle(meta: dict, quiet_s: float = 20, timeout: float = 180) -> None:
         time.sleep(5)
 
 
+def provision_kolibri_image(a: argparse.Namespace, meta: dict, profile_name: str, prof: dict, t0: float) -> None:
+    """Kolibri's image already has the launcher, wallpaper, swap, slim app set and every
+    preset identity; what is left is per-instance settings, the store and the snapshot."""
+    meta.update(profile=profile_name)
+    if a.ram:
+        meta["ram_mb"] = a.ram
+    save_meta(a.name, meta)
+    if running_pid(meta):
+        cmd_stop(argparse.Namespace(name=a.name))
+        meta = load_meta(a.name)
+    (avd_dir(a.name) / "config.ini").write_text(render_config(meta))
+    cmd_start(argparse.Namespace(name=a.name, window=False, cold=True, writable_system=False, no_wait=False, timeout=300))
+    meta = load_meta(a.name)
+    adb_retry(meta, "root")
+    wait_boot(meta, 120)
+    adb(meta, "shell", "setprop", "persist.sys.locale", a.locale)
+    hz = f"{float(prof.get('refresh_hz', meta['refresh_hz'])):.1f}"
+    for key in ("peak_refresh_rate", "min_refresh_rate"):
+        adb(meta, "shell", "settings", "put", "system", key, hz)
+    adb(meta, "shell", "settings", "put", "global", "captive_portal_mode", "0")
+    print("  store:", install_store(meta))
+    model = adb(meta, "shell", "getprop", "ro.product.model")
+    print(f"  model={model}  root={'on' if meta.get('root') else 'off'}  {hz} Hz")
+    meta = load_meta(a.name)
+    meta.update(provisioned=True)
+    save_meta(a.name, meta)
+    print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "kolibri-golden", check=False) or "saved")
+    print(f"provisioned {a.name} in {time.time() - t0:.0f}s")
+
+
 def cmd_provision(a: argparse.Namespace) -> None:
     meta = load_meta(a.name)
     profile_name = a.profile or meta["profile"]
     prof = device_profile({**meta, "profile": profile_name})
     t0 = time.time()
     print(f"provisioning {a.name} with profile {profile_name} ({prof.get('title', '')})")
+
+    if kolibri_image(meta) and profile_name != "custom":
+        provision_kolibri_image(a, meta, profile_name, prof, t0)
+        return
 
     # 1. The per-instance system overlay lives in the AVD dir; the shared base image stays pristine.
     if running_pid(meta) and not meta.get("writable_system"):

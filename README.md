@@ -27,6 +27,11 @@ Hypervisor framework for the CPU and Vulkan over MoltenVK for graphics. On top o
 SwiftUI app built for playing games: keyboard, mouse and gamepad mapping, up to 120 Hz, several phones
 at once, drag-and-drop installs and screen recording.
 
+Both the engine and the Android system can be built from source. The bundled engine is compiled from
+the Android Emulator sources, and `tools/aosp` builds Kolibri's own Android 12 image from AOSP on a
+Mac: dark UI, the Kolibri launcher as the only home app, no taskbar or nav bar, and phone models
+chosen at boot.
+
 <p align="center">
   <img src="docs/screenshots/devices-en.png" width="860" alt="Kolibri device manager">
 </p>
@@ -115,6 +120,7 @@ Kolibri.app (SwiftUI)  <-- gRPC, shared memory -->  Android Emulator engine  -->
 | `engine/src-patches/` | Patches and exact sources of the bundled engine |
 | `engine/slim/` | System packages removed from every phone |
 | `guest/` | The in-phone launcher (a Lawnchair fork, built from patches) and wallpaper |
+| `tools/aosp/` | Kolibri's own Android 12 image, built from AOSP in a Linux VM on the Mac |
 
 ## Building from source
 
@@ -132,6 +138,22 @@ engine/kolibrictl setup --accept-licenses
 engine/kolibrictl create phone1 --resolution 1920x1080 --refresh 120
 engine/kolibrictl provision phone1 && engine/kolibrictl start phone1
 ```
+
+### Self-built Android system
+
+`tools/aosp` builds a slim Android 12 (AOSP 12L, `android-12.1.0_r27`) for the engine, entirely on an
+Apple Silicon Mac: a Lima VM runs the x86_64 build tools through Rosetta. The image is about 590 MB
+compressed (the Google image download is 1.9 GB), cold-boots in about 20 s, and every phone model is
+built in and picked at boot, so phones need no writable system partition.
+
+```bash
+limactl start --name aosp tools/aosp/lima-aosp.yaml && limactl shell aosp sudo bash "$PWD/tools/aosp/vm-setup.sh"
+tools/aosp/build.sh                                   # first build: about a day; later ones: minutes
+engine/kolibrictl create phone2 --image android-32/kolibri --no-gms
+```
+
+The source checkout (about 70 GB) follows `tools/aosp/manifest-android-12.1.0_r27.xml`. The release
+still downloads Google's Android 16 image by default.
 
 ## License
 

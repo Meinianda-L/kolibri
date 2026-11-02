@@ -1,0 +1,4 @@
+# Device identity chosen at boot, like a real phone's: the engine passes the instance's
+# profile as androidboot.kolibri.profile, and the matching file (generated from
+# engine/profiles/*.json) overrides ro.product.* / fingerprint before anything reads them.
+import /product/etc/kolibri/profiles/${ro.boot.kolibri.profile:-stock}.prop

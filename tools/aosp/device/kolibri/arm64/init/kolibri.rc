@@ -1,0 +1,19 @@
+# Memory: zram (compressed RAM) first, then a swap file on the data disk for cold pages,
+# so a game's working set stays in the Mac's RAM and idle pages go to its SSD.
+service kolibri_swap /system/bin/sh /product/etc/kolibri/swap.sh
+    user root
+    group root
+    seclabel u:r:su:s0
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    start kolibri_swap
+
+# su (userdebug) stays hidden unless the instance turns root on (androidboot.kolibri.root=1):
+# anti-cheat and banking apps refuse to run when they find it.
+on post-fs
+    mount tmpfs tmpfs /system/xbin ro mode=0755,uid=0,gid=2000
+
+on post-fs && property:ro.boot.kolibri.root=1
+    umount /system/xbin

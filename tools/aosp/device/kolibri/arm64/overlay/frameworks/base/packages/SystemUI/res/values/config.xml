@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Quick settings a game player uses; no Bluetooth, flashlight, alarm, wallet, cast. -->
+    <string name="quick_settings_tiles_default" translatable="false">
+        internet,rotation,dnd,screenrecord,dark,airplane
+    </string>
+</resources>

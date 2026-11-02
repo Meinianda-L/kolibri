@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark system UI. -->
+    <integer name="config_defaultNightMode">2</integer>
+    <!-- No 60 Hz default cap: the panel runs at the instance's refresh rate (up to 120+). -->
+    <integer name="config_defaultRefreshRate">0</integer>
+    <integer name="config_defaultPeakRefreshRate">240</integer>
+</resources>

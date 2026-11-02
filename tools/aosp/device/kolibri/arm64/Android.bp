@@ -1,0 +1,17 @@
+// Kolibri Launcher (guest/launcher, a Lawnchair fork) as the only home app. Replacing
+// Launcher3QuickStep also removes the large-screen taskbar it draws on 12L, which is
+// where the on-screen Back/Home/Recents buttons came from: those live in the Mac toolbar.
+// build.sh copies the APK here from guest/launcher/out.
+android_app_import {
+    name: "KolibriLauncher",
+    apk: "prebuilt/KolibriLauncher.apk",
+    // The build uncompresses dex/JNI libs, which voids the APK's own signature: re-sign it.
+    default_dev_cert: true,
+    product_specific: true,
+    overrides: ["Launcher3QuickStep"],
+    // Jetpack WindowManager probes these at runtime; the image has neither.
+    optional_uses_libs: [
+        "androidx.window.extensions",
+        "androidx.window.sidecar",
+    ],
+}

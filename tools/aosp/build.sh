@@ -1,15 +1,33 @@
 #!/bin/bash
 # Build Kolibri's Android image inside the Lima VM (tools/aosp/lima-aosp.yaml).
-#   limactl shell aosp bash "$PWD/tools/aosp/build.sh" [jobs]     (from the repo root; ~ is mounted)
+#   tools/aosp/build.sh [jobs]     (on the Mac; it stages files, then builds in the VM)
 # Source: $HOME/aosp, a copy of /Volumes/aosp (AOSP android-12.1.0_r27) on the VM disk. Output: $HOME/out.
 set -eo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+DEVSRC="$HERE/device/kolibri/arm64"
+if [ "$(uname)" = Darwin ]; then
+    # On the Mac: stage what the image takes from the rest of the repo (the VM only mounts
+    # tools/aosp), then run this script inside the VM.
+    REPO="$(cd "$HERE/../.." && pwd)"
+    # No build machine's user/host/date in the image's fingerprint and build props.
+    BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d)}"
+    mkdir -p "$DEVSRC/prebuilt" "$DEVSRC/media"
+    rsync -a "$REPO/guest/launcher/out/KolibriLauncher.apk" "$DEVSRC/prebuilt/"
+    rsync -a "$REPO/guest/wallpaper/kolibri-wallpaper-2560x1440.png" "$DEVSRC/media/kolibri_wallpaper.png"
+    python3 "$HERE/gen-profiles.py" "$REPO" "$DEVSRC/profiles" SP2A.220505.008 "$BUILD_NUMBER"
+    exec limactl shell aosp env BUILD_NUMBER="$BUILD_NUMBER" bash "$HERE/build.sh" "$@"
+fi
 JOBS="${1:-6}"
-# The source tree walk at startup (soong's finder over virtiofs) opens many files at once.
+# The source tree walk at startup (soong's finder) opens many files at once.
 ulimit -n "$(ulimit -Hn)"
 SRC="$HOME/aosp"   # copied from /Volumes/aosp (virtiofs hits macOS file limits)
-HERE="$(cd "$(dirname "$0")" && pwd)"
 rsync -a --delete "$HERE/device/kolibri/" "$SRC/device/kolibri/"
+export BUILD_USERNAME=kolibri BUILD_HOSTNAME=kolibri BUILD_NUMBER
 cd "$SRC"
+# The board's product.prop (picked up from the device dir) carries the boot-time profile import.
+DEV="$SRC/device/kolibri/arm64"
+cmp -s "$DEV/product.prop" device/generic/goldfish/emulator64_arm64/product.prop || \
+    cp "$DEV/product.prop" device/generic/goldfish/emulator64_arm64/product.prop
 # Host dex2oat needs its heap below 4 GB. On x86_64 ART asks for that with MAP_32BIT, which
 # the arm64 kernel under Rosetta ignores (dex2oat aborts: "ref <= 0xFFFFFFFFU"); use ART's
 # linear-scan low-4GB allocator instead, as it already does on arm64 and macOS hosts.
@@ -17,6 +35,10 @@ MEMMAP=art/libartbase/base/mem_map.h
 grep -q 'defined(__APPLE__) || defined(__x86_64__)' "$MEMMAP" || \
     sed -i 's/(defined(__aarch64__) || defined(__APPLE__))/(defined(__aarch64__) || defined(__APPLE__) || defined(__x86_64__))/' "$MEMMAP"
 export OUT_DIR="$HOME/out"
+# Partition build.props don't depend on BUILD_NUMBER; drop them so every image carries this one.
+P="$OUT_DIR/target/product/emulator64_arm64"
+rm -f "$P/system/build.prop" "$P/system_ext/etc/build.prop" "$P/product/etc/build.prop" \
+      "$P/vendor/build.prop" "$P/odm/etc/build.prop" "$P/vendor/odm/etc/build.prop"
 source build/envsetup.sh
 lunch kolibri_arm64-userdebug
 # The emulator image zip (system-images layout: system.img, vendor.img, kernel, ramdisk, ...).
