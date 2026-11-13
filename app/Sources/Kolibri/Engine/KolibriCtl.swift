@@ -63,8 +63,22 @@ enum KolibriCtl {
         var errorDescription: String? { message }
     }
 
+    /// Reads a pipe to EOF on its own thread. Pipes hold ~64 KB: a child that writes more
+    /// blocks until someone reads, so reading only after it exits would wait forever.
+    private final class Drain: @unchecked Sendable {
+        private var data = Data()
+        private let done = DispatchSemaphore(value: 0)
+        init(_ pipe: Pipe) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.data = pipe.fileHandleForReading.readDataToEndOfFile()
+                self.done.signal()
+            }
+        }
+        var text: String { done.wait(); return String(decoding: data, as: UTF8.self) }
+    }
+
     @discardableResult
-    static func run(_ args: [String], input: Data? = nil) async throws -> String {
+    static func run(_ args: [String]) async throws -> String {
         try await withCheckedThrowingContinuation { cont in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -72,13 +86,15 @@ enum KolibriCtl {
             let out = Pipe(), err = Pipe()
             p.standardOutput = out
             p.standardError = err
+            let o = Drain(out), e = Drain(err)
             p.terminationHandler = { proc in
-                let o = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                let e = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                if proc.terminationStatus == 0 {
-                    cont.resume(returning: o.trimmingCharacters(in: .whitespacesAndNewlines))
-                } else {
-                    cont.resume(throwing: Failure(message: e.isEmpty ? o : e))
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let stdout = o.text, stderr = e.text
+                    if proc.terminationStatus == 0 {
+                        cont.resume(returning: stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+                    } else {
+                        cont.resume(throwing: Failure(message: stderr.isEmpty ? stdout : stderr))
+                    }
                 }
             }
             do { try p.run() } catch { cont.resume(throwing: error) }
@@ -94,6 +110,7 @@ enum KolibriCtl {
             let out = Pipe(), err = Pipe()
             p.standardOutput = out
             p.standardError = err
+            let e = Drain(err)
             final class Buffer: @unchecked Sendable { var data = Data() }
             let buf = Buffer()
             out.fileHandleForReading.readabilityHandler = { h in
@@ -106,9 +123,11 @@ enum KolibriCtl {
             }
             p.terminationHandler = { proc in
                 out.fileHandleForReading.readabilityHandler = nil
-                let e = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                if proc.terminationStatus == 0 { cont.resume() }
-                else { cont.resume(throwing: Failure(message: e.trimmingCharacters(in: .whitespacesAndNewlines))) }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let stderr = e.text
+                    if proc.terminationStatus == 0 { cont.resume() }
+                    else { cont.resume(throwing: Failure(message: stderr.trimmingCharacters(in: .whitespacesAndNewlines))) }
+                }
             }
             do { try p.run() } catch { cont.resume(throwing: error) }
         }
@@ -125,7 +144,9 @@ enum KolibriCtl {
 
     /// Foreground Android package, used to auto-select a keymap.
     static func foregroundPackage(_ name: String) async -> String? {
-        guard let out = try? await adb(name, ["shell", "dumpsys", "activity", "activities"]) else { return nil }
+        // Filtered in the guest: the full dump is hundreds of KB every poll.
+        guard let out = try? await adb(name, ["shell", "dumpsys activity activities | grep -m 2 -E 'topResumedActivity|mResumedActivity'"])
+        else { return nil }
         for line in out.split(separator: "\n") where line.contains("topResumedActivity") || line.contains("mResumedActivity") {
             // ... ActivityRecord{1234 u0 com.pkg/.Main t12}
             if let r = line.range(of: #"u\d+ ([\w.]+)/"#, options: .regularExpression) {

@@ -444,7 +444,9 @@ def cmd_start(a: argparse.Namespace) -> None:
 # when a game starts and the new PCM stream never starts on the engine side: every
 # pcm_writei then fails with EIO and the game stays silent until it is restarted.
 # Restarting the audio HAL (audioserver follows) makes every AudioTrack reconnect.
-AUDIO_HAL_TAG = "android.hardware.audio@7.1-impl.ranchu"
+# Android 16's HAL is 7.1 and says "pcm_writei failed"; Android 12's (Kolibri's image) is 7.0
+# and says "pcm_write failed".
+AUDIO_HAL_TAGS = ("android.hardware.audio@7.1-impl.ranchu", "android.hardware.audio@7.0-impl.ranchu")
 
 
 def spawn_audio_watch(name: str) -> None:
@@ -484,9 +486,10 @@ def cmd_audio_watch(a: argparse.Namespace) -> None:
         except subprocess.TimeoutExpired:
             continue
         cat = subprocess.Popen([str(ADB), "-s", serial(meta), "logcat", "-T", "1", "-v", "brief",
-                                f"{AUDIO_HAL_TAG}:W", "*:S"], stdout=subprocess.PIPE, text=True, env=env())
+                                *(f"{tag}:W" for tag in AUDIO_HAL_TAGS), "*:S"],
+                               stdout=subprocess.PIPE, text=True, env=env())
         for line in cat.stdout:  # type: ignore[union-attr]
-            if "pcm_writei failed" not in line:
+            if "pcm_writei failed" not in line and "pcm_write failed" not in line:
                 continue
             now = time.time()
             hits = [t for t in hits if now - t < 3] + [now]
@@ -497,7 +500,7 @@ def cmd_audio_watch(a: argparse.Namespace) -> None:
             if len(heals) > 3:
                 log("audio still failing after 3 restarts in 10 min; leaving it alone")
                 continue
-            log("audio output stuck (pcm_writei I/O error); restarting the guest audio HAL")
+            log("audio output stuck (pcm write I/O error); restarting the guest audio HAL")
             cat.terminate()
             try:
                 heal_audio(meta)
@@ -1224,7 +1227,11 @@ def cmd_clone(a: argparse.Namespace) -> None:
 # engine and every other command keep using the usual path.
 
 def qemu_img(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run([str(SDK / "emulator" / "qemu-img"), *args], capture_output=True, text=True, check=check)
+    # The app ships its own engine; Google's (SDK/emulator) only exists with Android Studio.
+    tool = next((p for p in (SRC_ENGINE / "qemu-img", SDK / "emulator/qemu-img") if p.exists()), None)
+    if tool is None:
+        die("qemu-img not found (no engine installed)")
+    return subprocess.run([str(tool), *args], capture_output=True, text=True, check=check)
 
 
 def dir_bytes(d: Path) -> int:
@@ -1431,7 +1438,7 @@ def cmd_reset(a: argparse.Namespace) -> None:
     meta.pop("grow_fs", None)  # wipe-data formats /data at the full size
     save_meta(a.name, meta)
     cmd_start(_ns(a.name, cold=True, wipe=True, writable_system=True))
-    cmd_provision(argparse.Namespace(name=a.name, profile=None, locale="zh-CN", ram=None, no_slim=False))
+    cmd_provision(argparse.Namespace(name=a.name, profile=None, locale=meta.get("locale", "zh-CN"), ram=None, no_slim=False))
     meta = load_meta(a.name)
     settle(meta)
     print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "default_boot", check=False) or "saved")
@@ -1492,7 +1499,7 @@ def settle(meta: dict, quiet_s: float = 20, timeout: float = 180) -> None:
 def provision_kolibri_image(a: argparse.Namespace, meta: dict, profile_name: str, prof: dict, t0: float) -> None:
     """Kolibri's image already has the launcher, wallpaper, swap, slim app set and every
     preset identity; what is left is per-instance settings, the store and the snapshot."""
-    meta.update(profile=profile_name)
+    meta.update(profile=profile_name, locale=a.locale)
     if a.ram:
         meta["ram_mb"] = a.ram
     save_meta(a.name, meta)
@@ -1504,7 +1511,12 @@ def provision_kolibri_image(a: argparse.Namespace, meta: dict, profile_name: str
     meta = load_meta(a.name)
     adb_retry(meta, "root")
     wait_boot(meta, 120)
-    adb(meta, "shell", "setprop", "persist.sys.locale", a.locale)
+    if adb(meta, "shell", "getprop", "persist.sys.locale") != a.locale:
+        # The image boots in Chinese; another language takes a restart to apply.
+        adb(meta, "shell", "setprop", "persist.sys.locale", a.locale)
+        reboot_and_wait(meta)
+        adb_retry(meta, "root")
+        wait_boot(meta, 120)
     hz = f"{float(prof.get('refresh_hz', meta['refresh_hz'])):.1f}"
     for key in ("peak_refresh_rate", "min_refresh_rate"):
         adb(meta, "shell", "settings", "put", "system", key, hz)
@@ -1595,7 +1607,7 @@ def cmd_provision(a: argparse.Namespace) -> None:
     print(f"  swap={swap or 'none'}  hwui={adb(meta, 'shell', 'getprop', 'debug.hwui.renderer')}")
     print(f"  model={model}  locale={adb(meta, 'shell', 'getprop', 'persist.sys.locale')}  {rate}")
     meta = load_meta(a.name)
-    meta.update(provisioned=True, profile=profile_name)
+    meta.update(provisioned=True, profile=profile_name, locale=a.locale)
     save_meta(a.name, meta)
     print("  snapshot:", adb(meta, "emu", "avd", "snapshot", "save", "kolibri-golden", check=False) or "saved")
     print(f"provisioned {a.name} in {time.time() - t0:.0f}s")

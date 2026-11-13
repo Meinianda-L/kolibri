@@ -90,7 +90,7 @@ struct ManagerView: View {
                 // A new device is only a config until it is provisioned (system, launcher, store).
                 await refresh()
                 if let inst = instances.first(where: { $0.name == name }) {
-                    act(inst, ["provision", name], label: L("初始化中…"))
+                    act(inst, ["provision", name, "--locale", Self.guestLocale], label: L("初始化中…"))
                 }
             }
         }
@@ -129,8 +129,11 @@ struct ManagerView: View {
         }
     }
 
+    /// New phones speak the app's language.
+    static var guestLocale: String { AppLanguage.resolved == .en ? "en-US" : "zh-CN" }
+
     private func start(_ inst: InstanceInfo) {
-        act(inst, inst.provisioned ? ["start", inst.name] : ["provision", inst.name],
+        act(inst, inst.provisioned ? ["start", inst.name] : ["provision", inst.name, "--locale", Self.guestLocale],
             label: inst.provisioned ? L("启动中…") : L("初始化中…")) {
             openWindow(id: "game", value: inst.name)
         }

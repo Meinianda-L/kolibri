@@ -665,11 +665,7 @@ final class GameSession: ObservableObject {
             } else {
                 let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kolibri-bundle-\(UUID().uuidString)")
                 defer { try? FileManager.default.removeItem(at: dir) }
-                let unzip = Process()
-                unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-                unzip.arguments = ["-x", "-k", url.path, dir.path]
-                try unzip.run()
-                unzip.waitUntilExit()
+                try await Self.unzip(url, to: dir)
                 let files = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil)?.compactMap { $0 as? URL } ?? []
                 let apks = files.filter { $0.pathExtension.lowercased() == "apk" }.map(\.path)
                 guard !apks.isEmpty else { return L("安装失败：\(name) 里没有安装包") }
@@ -686,6 +682,20 @@ final class GameSession: ObservableObject {
         }
     }
 
+    /// A bundle can be gigabytes: wait for ditto without blocking the main thread (and the game).
+    private static func unzip(_ src: URL, to dir: URL) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            p.arguments = ["-x", "-k", src.path, dir.path]
+            p.terminationHandler = { proc in
+                if proc.terminationStatus == 0 { cont.resume() }
+                else { cont.resume(throwing: KolibriCtl.Failure(message: L("安装包无法解压，可能已损坏"))) }
+            }
+            do { try p.run() } catch { cont.resume(throwing: error) }
+        }
+    }
+
     /// adb's INSTALL_FAILED_* codes in words.
     private static func installError(_ raw: String) -> String {
         let table: [(String, String)] = [
@@ -694,7 +704,7 @@ final class GameSession: ObservableObject {
             ("VERSION_DOWNGRADE", L("已安装更高版本")),
             ("UPDATE_INCOMPATIBLE", L("和已安装的版本签名不同，请先卸载旧版")),
             ("INVALID_APK", L("安装包已损坏，请重新下载")),
-            ("OLDER_SDK", L("这个版本不支持安卓 16")),
+            ("OLDER_SDK", L("这个游戏需要更新的安卓版本")),
         ]
         return table.first { raw.contains($0.0) }?.1 ?? raw.split(separator: "\n").last.map(String.init) ?? raw
     }

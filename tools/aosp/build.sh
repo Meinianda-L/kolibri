@@ -38,7 +38,9 @@ export OUT_DIR="$HOME/out"
 # Partition build.props don't depend on BUILD_NUMBER; drop them so every image carries this one.
 P="$OUT_DIR/target/product/emulator64_arm64"
 rm -f "$P/system/build.prop" "$P/system_ext/etc/build.prop" "$P/product/etc/build.prop" \
-      "$P/vendor/build.prop" "$P/odm/etc/build.prop" "$P/vendor/odm/etc/build.prop"
+      "$P/vendor/build.prop" "$P/odm/etc/build.prop" "$P/vendor/odm/etc/build.prop" \
+      "$P/vendor/vendor_dlkm/etc/build.prop" "$P/vendor/odm_dlkm/etc/build.prop" \
+      "$P/ramdisk/system/etc/ramdisk/build.prop"
 source build/envsetup.sh
 lunch kolibri_arm64-userdebug
 # The emulator image zip (system-images layout: system.img, vendor.img, kernel, ramdisk, ...).
