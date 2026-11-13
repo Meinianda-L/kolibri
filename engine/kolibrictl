@@ -145,6 +145,9 @@ def render_config(meta: dict) -> str:
         dpi=meta["dpi"],
         vsync=meta["refresh_hz"],
         data_size=meta["data_gb"],
+        # pipe: GL/Vulkan commands go through a goldfish pipe; asg: a shared-memory ring
+        # (address space graphics), fewer copies and exits per frame.
+        gltransport=meta.get("gltransport", "pipe"),
     )
 
 
