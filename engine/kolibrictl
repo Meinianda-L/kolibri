@@ -70,6 +70,21 @@ def boot_profile(meta: dict) -> bool:
     return kolibri_image(meta) and meta.get("profile", "stock") != "custom"
 
 
+def check_boot_profile(meta: dict) -> None:
+    """On Kolibri's image the profile is a file in the image; an image older than the
+    profile list boots as the stock emulator instead. Say so rather than fail silently."""
+    if not boot_profile(meta):
+        return
+    prof = device_profile(meta)
+    want = prof.get("model")
+    if not want or prof.get("stock"):
+        return
+    got = adb(meta, "shell", "getprop", "ro.product.model", check=False)
+    if got != want:
+        print(f"  warning: this Android image has no '{meta.get('profile')}' profile (model is {got!r}, "
+              f"expected {want!r}); update Kolibri's Android image or pick another model", file=sys.stderr)
+
+
 def sysimg_rel(image: str) -> str:
     api, tag = image.split("/")
     return f"system-images/{api}/{tag}/arm64-v8a/"
@@ -1061,8 +1076,10 @@ def cmd_wallpaper(a: argparse.Namespace) -> None:
         die(f"{a.name} not running (start it first)")
     adb_retry(meta, "root")
     wait_boot(meta, 60)
-    ensure_root_remount(meta)
-    write_identity(meta, device_profile(meta))
+    if not boot_profile(meta):
+        # Google's image: the wallpaper and identity live in an appended build.prop block.
+        ensure_root_remount(meta)
+        write_identity(meta, device_profile(meta))
     clear_wallpaper(meta)
     reboot_and_wait(meta)
     settle(meta)
@@ -1107,12 +1124,18 @@ def cmd_reprofile(a: argparse.Namespace) -> None:
     prof = device_profile({**meta, "profile": name})
     adb_retry(meta, "root")
     wait_boot(meta, 60)
-    ensure_root_remount(meta)
-    write_identity(meta, prof)
+    if boot_profile({**meta, "profile": name}):
+        # Kolibri's image picks the profile at boot: save it, then a cold restart applies it.
+        meta["profile"] = name
+        save_meta(a.name, meta)
+    else:
+        ensure_root_remount(meta)
+        write_identity(meta, prof)
     reboot_and_wait(meta)
     meta = load_meta(a.name)
     meta["profile"] = name
     save_meta(a.name, meta)
+    check_boot_profile(meta)
     settle(meta)
     print(f"{a.name}: profile {name} ({prof.get('title', '')})  model={adb(meta, 'shell', 'getprop', 'ro.product.model')}"
           f"  soc={adb(meta, 'shell', 'getprop', 'ro.soc.model')}")
@@ -1175,6 +1198,7 @@ def cmd_edit(a: argparse.Namespace) -> None:
         reboot_and_wait(meta)
         adb_retry(meta, "root")
         wait_boot(meta, 120)
+        check_boot_profile(meta)
     if "root" in changes:
         print("  root:", apply_root(meta, bool(changes["root"])))
     if "refresh_hz" in changes:
@@ -1422,6 +1446,9 @@ def cmd_slim(a: argparse.Namespace) -> None:
     meta = load_meta(a.name)
     if not running_pid(meta):
         die(f"{a.name} not running (start it first)")
+    if kolibri_image(meta):
+        print(f"{a.name}: Kolibri's Android image is already slim; nothing to remove")
+        return
     adb_retry(meta, "root")
     wait_boot(meta, 60)
     ensure_root_remount(meta)
@@ -1440,7 +1467,7 @@ def cmd_reset(a: argparse.Namespace) -> None:
     meta["provisioned"] = False
     meta.pop("grow_fs", None)  # wipe-data formats /data at the full size
     save_meta(a.name, meta)
-    cmd_start(_ns(a.name, cold=True, wipe=True, writable_system=True))
+    cmd_start(_ns(a.name, cold=True, wipe=True, writable_system=not boot_profile(meta)))
     cmd_provision(argparse.Namespace(name=a.name, profile=None, locale=meta.get("locale", "zh-CN"), ram=None, no_slim=False))
     meta = load_meta(a.name)
     settle(meta)
@@ -1527,6 +1554,7 @@ def provision_kolibri_image(a: argparse.Namespace, meta: dict, profile_name: str
     print("  store:", install_store(meta))
     model = adb(meta, "shell", "getprop", "ro.product.model")
     print(f"  model={model}  root={'on' if meta.get('root') else 'off'}  {hz} Hz")
+    check_boot_profile(meta)
     meta = load_meta(a.name)
     meta.update(provisioned=True)
     save_meta(a.name, meta)

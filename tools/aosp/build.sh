@@ -34,6 +34,8 @@ cmp -s "$DEV/product.prop" device/generic/goldfish/emulator64_arm64/product.prop
 MEMMAP=art/libartbase/base/mem_map.h
 grep -q 'defined(__APPLE__) || defined(__x86_64__)' "$MEMMAP" || \
     sed -i 's/(defined(__aarch64__) || defined(__APPLE__))/(defined(__aarch64__) || defined(__APPLE__) || defined(__x86_64__))/' "$MEMMAP"
+# A changed upstream line would leave the patch silently unapplied and dex2oat failing hours in.
+grep -q 'defined(__APPLE__) || defined(__x86_64__)' "$MEMMAP" || { echo "ART low-4GB patch did not apply to $MEMMAP"; exit 1; }
 export OUT_DIR="$HOME/out"
 # Partition build.props don't depend on BUILD_NUMBER; drop them so every image carries this one.
 P="$OUT_DIR/target/product/emulator64_arm64"
@@ -44,11 +46,14 @@ rm -f "$P/system/build.prop" "$P/system_ext/etc/build.prop" "$P/product/etc/buil
 source build/envsetup.sh
 lunch kolibri_arm64-userdebug
 # The emulator image zip (system-images layout: system.img, vendor.img, kernel, ramdisk, ...).
-# Rosetta now and then fails to translate a tool under load ("Failed to map AOT header");
-# ninja resumes where it stopped, so a failed run is simply retried.
+# Rosetta now and then crashes a translated tool under load (seen: "Failed to map AOT header",
+# a clang segfault, a JVM rejecting its own options); ninja resumes where it stopped, so such
+# a run is retried. Any other failure is a real build error: stop at once.
+GLITCH='Failed to map AOT header|rosetta error|Segmentation fault|Bus error|Unrecognized option: -$'
 for try in 1 2 3 4 5 6 7 8; do
-    if m -j"$JOBS" && m -j"$JOBS" emu_img_zip; then ok=1; break; fi
-    echo "#### build attempt $try failed, retrying ####"
+    if { m -j"$JOBS" && m -j"$JOBS" emu_img_zip; } 2>&1 | tee "$OUT_DIR/attempt.log"; then ok=1; break; fi
+    grep -qE "$GLITCH" "$OUT_DIR/attempt.log" || { echo "#### build failed (not a Rosetta glitch) ####"; exit 1; }
+    echo "#### build attempt $try hit a Rosetta glitch, retrying ####"
     sleep 5
 done
 [ -n "$ok" ] || { echo "#### build failed after retries ####"; exit 1; }

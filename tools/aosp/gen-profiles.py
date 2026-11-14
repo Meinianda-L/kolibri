@@ -19,7 +19,10 @@ ctl = importlib.util.module_from_spec(spec)
 loader.exec_module(ctl)
 
 out.mkdir(parents=True, exist_ok=True)
-for f in sorted((repo / "engine/profiles").glob("*.json")):
+profiles = sorted((repo / "engine/profiles").glob("*.json"))
+for stale in set(out.glob("*.prop")) - {out / f"{f.stem}.prop" for f in profiles}:
+    stale.unlink()   # a retired profile must not stay in the image
+for f in profiles:
     p = json.loads(f.read_text())
     lines = [] if p.get("stock") or f.stem == "stock" else \
         [l for l in ctl.profile_props(p, build_id, incremental, "12") if not l.startswith("#")]
