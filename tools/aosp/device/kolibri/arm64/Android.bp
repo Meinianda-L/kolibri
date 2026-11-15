@@ -8,7 +8,22 @@ android_app_import {
     // The build uncompresses dex/JNI libs, which voids the APK's own signature: re-sign it.
     default_dev_cert: true,
     product_specific: true,
-    overrides: ["Launcher3QuickStep"],
+    // Also leaves out system parts a game phone never uses (Bluetooth stays: the
+    // emulator's vendor partition declares the hardware, and Settings expects its app).
+    overrides: [
+        "Launcher3QuickStep",
+        "BasicDreams", "EasterEgg", "LiveWallpapersPicker", "MusicFX", "Traceur",
+        "NfcNci", "Tag", "SecureElement",
+        "BuiltInPrintService", "PrintRecommendationService",
+        "DynamicSystemInstallationService", "CameraExtensionsProxy",
+        "DisplayCutoutEmulationCornerOverlay", "DisplayCutoutEmulationDoubleOverlay", "DisplayCutoutEmulationEmu01Overlay",
+        "DisplayCutoutEmulationHoleOverlay", "DisplayCutoutEmulationTallOverlay", "DisplayCutoutEmulationWaterfallOverlay",
+        "EmulationPixel2XLOverlay", "EmulationPixel3XLOverlay", "EmulationPixel4Overlay", "EmulationPixel4XLOverlay",
+        "EmulationPixel4aOverlay", "EmulationPixel5Overlay",
+        "SystemUIEmulationPixel2XLOverlay", "SystemUIEmulationPixel3Overlay", "SystemUIEmulationPixel3XLOverlay",
+        "SystemUIEmulationPixel3aOverlay", "SystemUIEmulationPixel3aXLOverlay", "SystemUIEmulationPixel4Overlay",
+        "SystemUIEmulationPixel4XLOverlay", "SystemUIEmulationPixel4aOverlay", "SystemUIEmulationPixel5Overlay",
+    ],
     // Jetpack WindowManager probes these at runtime; the image has neither.
     optional_uses_libs: [
         "androidx.window.extensions",
