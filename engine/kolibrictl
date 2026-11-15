@@ -543,9 +543,10 @@ SDK_PACKAGES = [
      "url": REPO_URL + "emulator-darwin_aarch64-15507667.zip",
      "sha1": "45328141bb585e096a5bebf870ff351e140bcda3", "size": 383903546,
      "license": "android-sdk-license", "check": "emulator/emulator", "root": "emulator", "into": ""},
-    {"id": "kolibri-image", "title": "Kolibri Android 12 system",
-     "url": "https://github.com/Meinianda-L/kolibri/releases/download/v0.3.0/Kolibri-Android12-arm64-20261102.zip",
-     "sha1": "580b8ed2704879e0c06d61fa3650c25483f7c47c", "size": 592334536,
+    # "versioned": an installed copy from another build (stamp mismatch) is replaced.
+    {"id": "kolibri-image", "title": "Kolibri Android 12 system", "versioned": True,
+     "url": "https://github.com/Meinianda-L/kolibri/releases/download/v0.3.2/Kolibri-Android12-arm64-20261115.zip",
+     "sha1": "8a5f7ef435123d824548ae61b85d9c0b030e1970", "size": 599280457,
      "license": None, "check": "system-images/android-32/kolibri/arm64-v8a/system.img",
      "root": "arm64-v8a", "into": "system-images/android-32/kolibri"},
     # Only fetched while a phone still uses it (see missing_packages).
@@ -558,11 +559,26 @@ SDK_PACKAGES = [
 LICENSE_SOURCES = [REPO_URL + "repository2-3.xml", REPO_URL + "sys-img/google_apis/sys-img2-3.xml"]
 
 
+def package_stamp(p: dict) -> Path:
+    return SDK / p["into"] / p["root"] / ".kolibri-sha1"
+
+
+def package_current(p: dict) -> bool:
+    if not (SDK / p["check"]).exists():
+        return False
+    if p.get("versioned"):
+        try:
+            return package_stamp(p).read_text().strip() == p["sha1"]
+        except OSError:
+            return False
+    return True
+
+
 def missing_packages() -> list[dict]:
     # An app that ships the engine built from source doesn't need Google's, and Google's
     # system image is only needed by phones created on it.
     used = {load_meta(n).get("image", GOOGLE_IMAGE) for n in instances()}
-    return [p for p in SDK_PACKAGES if not (SDK / p["check"]).exists()
+    return [p for p in SDK_PACKAGES if not package_current(p)
             and not (p["id"] == "emulator" and BUNDLED_ENGINE.exists())
             and (p.get("image") is None or p["image"] in used)]
 
@@ -600,6 +616,11 @@ def cmd_setup(a: argparse.Namespace) -> None:
         return
     if not a.accept_licenses:
         die("downloading needs --accept-licenses (Android SDK License Agreement)")
+    # Replacing an image under a running phone would pull its system out from under it.
+    busy = [n for n in instances() if running_pid(load_meta(n)) and any(
+        p.get("versioned") and load_meta(n).get("image", GOOGLE_IMAGE) in p["into"] for p in missing)]
+    if busy:
+        die(f"stop {', '.join(busy)} first: the Android system they run is being updated")
     import hashlib
     import urllib.request
     SDK.mkdir(parents=True, exist_ok=True)
@@ -633,6 +654,8 @@ def cmd_setup(a: argparse.Namespace) -> None:
         if dest.exists():
             shutil.rmtree(dest)
         shutil.move(str(unpack / p["root"]), str(dest))
+        if p.get("versioned"):
+            package_stamp(p).write_text(p["sha1"] + "\n")
         shutil.rmtree(unpack, ignore_errors=True)
         zip_path.unlink(missing_ok=True)
         done_before += p["size"]

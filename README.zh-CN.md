@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/Meinianda-L/kolibri/main/install.sh
 [Releases](https://github.com/Meinianda-L/kolibri/releases/latest) 下载 `Kolibri-<版本>-macOS-arm64.zip`。
 程序没有经过苹果公证，用浏览器下载的需要先运行一次 `xattr -dr com.apple.quarantine /Applications/Kolibri.app`。
 
-首次启动时会从本项目的 Release 下载 Kolibri 自己的安卓 12 系统（约 590 MB），并在同意 Android SDK 许可协议后从 Google 下载 adb。如果系统提示安装命令行开发者工具，
+首次启动时会从本项目的 Release 下载 Kolibri 自己的安卓 12 系统（约 600 MB），并在同意 Android SDK 许可协议后从 Google 下载 adb。如果系统提示安装命令行开发者工具，
 请同意：Kolibri 的设备管理工具使用其中的 Python。
 
 系统要求：Apple Silicon Mac、macOS 15 及以上、约 10 GB 可用空间。
@@ -129,7 +129,7 @@ engine/kolibrictl provision phone1 && engine/kolibrictl start phone1
 ### 自编译安卓系统
 
 `tools/aosp` 为引擎编译一个精简的安卓 12（AOSP 12L，`android-12.1.0_r27`），全程只用一台 Apple Silicon Mac：
-Lima 虚拟机通过 Rosetta 运行 x86_64 编译工具。镜像压缩后约 590 MB（Google 镜像下载为 1.9 GB），冷启动约 20 秒；
+Lima 虚拟机通过 Rosetta 运行 x86_64 编译工具。镜像压缩后约 600 MB（Google 镜像下载为 1.9 GB），冷启动约 20 秒；
 所有机型都编进了系统、开机时选择，手机不需要可写的系统分区。
 
 ```bash

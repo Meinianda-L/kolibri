@@ -48,7 +48,7 @@ You can also download `Kolibri-<version>-macOS-arm64.zip` from
 browser download needs `xattr -dr com.apple.quarantine /Applications/Kolibri.app` once.
 
 On first launch Kolibri downloads its own Android 12 system from this project's releases (about
-590 MB) and adb from Google (after you accept the Android SDK license). If macOS offers to install the Command Line Tools, accept: Kolibri's
+600 MB) and adb from Google (after you accept the Android SDK license). If macOS offers to install the Command Line Tools, accept: Kolibri's
 device tool runs on the Python they include.
 
 Requirements: an Apple Silicon Mac, macOS 15 or later, about 10 GB of free disk space.
@@ -142,7 +142,7 @@ engine/kolibrictl provision phone1 && engine/kolibrictl start phone1
 ### Self-built Android system
 
 `tools/aosp` builds a slim Android 12 (AOSP 12L, `android-12.1.0_r27`) for the engine, entirely on an
-Apple Silicon Mac: a Lima VM runs the x86_64 build tools through Rosetta. The image is about 590 MB
+Apple Silicon Mac: a Lima VM runs the x86_64 build tools through Rosetta. The image is about 600 MB
 compressed (the Google image download is 1.9 GB), cold-boots in about 20 s, and every phone model is
 built in and picked at boot, so phones need no writable system partition.
 
